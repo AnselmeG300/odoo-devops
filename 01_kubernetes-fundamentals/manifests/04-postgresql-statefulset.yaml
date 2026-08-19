@@ -63,7 +63,7 @@ spec:
       # ─── CONTENEUR PRINCIPAL : PostgreSQL ──────────────────────────────────
       containers:
         - name: postgresql
-          image: postgres:14    # Image officielle PostgreSQL 14 (Docker Hub)
+          image: postgres:15    # Image officielle PostgreSQL 14 (Docker Hub)
                                 # En production : utiliser une version fixe (ex: 14.11)
           ports:
             - containerPort: 5432
