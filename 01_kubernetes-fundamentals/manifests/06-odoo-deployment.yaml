@@ -1,0 +1,234 @@
+# =============================================================================
+# DEPLOYMENT - Application Odoo avec init containers et sidecar Fluent Bit
+# =============================================================================
+#
+# Correctifs apportes par rapport a la version initiale :
+#   1. Ajout d'un initContainer "odoo-db-init" qui initialise le schema
+#      de la base AVANT le demarrage du conteneur principal.
+#      Cause racine du bug precedent : "-i base" sans "-d <base>" n'initialise
+#      rien, d'ou les erreurs KeyError 'ir.http' et
+#      relation "ir_module_module" does not exist, puis la boucle de restart.
+#   2. Le conteneur principal ne fait plus l'init : il sert juste l'application
+#      avec "-d odoo_db".
+#   3. Ajout d'une startupProbe pour couvrir le temps de demarrage d'Odoo
+#      sans que la livenessProbe ne tue le pod trop tot.
+#   4. Ajout de la cle DB_NAME cote ConfigMap (voir note en bas de fichier).
+#
+# Structure du pod - QUATRE conteneurs (2 init + 2 principaux) :
+#   1. wait-for-postgresql  -> INIT : attend que la BDD soit joignable (TCP)
+#   2. odoo-db-init         -> INIT : initialise le schema (-i base) puis stop
+#   3. odoo                 -> conteneur principal : l'application
+#   4. log-exporter         -> SIDECAR Fluent Bit : collecte les logs Odoo
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: odoo
+  namespace: odoo
+  labels:
+    app.kubernetes.io/name: odoo
+    app.kubernetes.io/instance: odoo
+    app.kubernetes.io/component: application
+spec:
+  replicas: 1     # Une seule instance pour ce sprint.
+                  # NE PAS mettre plus d'1 replica tant que l'init se fait dans
+                  # un initContainer sur chaque pod : plusieurs pods tenteraient
+                  # d'initialiser la meme base en parallele (race condition).
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: odoo
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: odoo
+        app.kubernetes.io/instance: odoo
+        app.kubernetes.io/component: application
+
+    spec:
+      # ─── INIT CONTAINERS (executes dans l'ordre, avant les principaux) ─────
+      initContainers:
+
+        # ── Init 1 : attente de PostgreSQL ──────────────────────────────────
+        - name: wait-for-postgresql
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              # Teste la connexion TCP sur le port 5432 jusqu'a succes.
+              until nc -z postgresql-svc 5432; do
+                echo "PostgreSQL pas encore pret, nouvelle tentative dans 2s..."
+                sleep 2
+              done
+              echo "PostgreSQL est pret."
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+
+        # ── Init 2 : initialisation du schema Odoo ──────────────────────────
+        # Cible explicitement la base avec "-d odoo_db" (le correctif cle).
+        # "--stop-after-init" : Odoo initialise puis s'arrete (exit 0), ce qui
+        # permet a Kubernetes de passer au conteneur principal.
+        # Idempotent : au redemarrage, si la base est deja initialisee,
+        # "-i base" est ignore et ce conteneur ressort quasi immediatement.
+        - name: odoo-db-init
+          image: odoo:16.0
+          args:
+            - -d
+            - odoo_db
+            - -i
+            - base
+            - --without-demo=all   # retirer cette ligne pour charger les demos
+            - --stop-after-init
+          env:
+            - name: HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: HOST
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: PORT
+            - name: USER
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: USER
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: odoo-secret
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+      # ─── CONTENEURS PRINCIPAUX ────────────────────────────────────────────
+      containers:
+
+        # ── Conteneur 1 : Odoo ──────────────────────────────────────────────
+        - name: odoo
+          image: odoo:16.0
+          # Plus de "-i base" ici : l'init est faite par l'initContainer.
+          # On cible juste la base pour eviter tout auto-select ambigu.
+          args:
+            - -d
+            - odoo_db
+
+          ports:
+            - containerPort: 8069
+              name: http
+            - containerPort: 8072
+              name: longpolling
+
+          env:
+            - name: HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: HOST
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: PORT
+            - name: USER
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: USER
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: odoo-secret
+                  key: POSTGRES_PASSWORD
+
+          # STARTUP PROBE - couvre la phase de demarrage.
+          # Tant qu'elle n'a pas reussi, liveness et readiness sont suspendues.
+          # 18 echecs x 10s = jusqu'a 180s de marge de demarrage.
+          startupProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            periodSeconds: 10
+            failureThreshold: 18
+
+          # LIVENESS PROBE - le conteneur est-il encore vivant ?
+          # Plus besoin d'initialDelaySeconds : la startupProbe s'en charge.
+          livenessProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            periodSeconds: 15
+            failureThreshold: 5
+
+          # READINESS PROBE - le pod est-il pret a recevoir du trafic ?
+          readinessProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            periodSeconds: 10
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+          volumeMounts:
+            - name: odoo-data
+              mountPath: /var/lib/odoo
+            - name: odoo-logs
+              mountPath: /var/log/odoo
+
+        # ── Conteneur 2 : Fluent Bit (sidecar log-exporter) ─────────────────
+        - name: log-exporter
+          image: fluent/fluent-bit:2.1.10
+          args:
+            - "-c"
+            - "/fluent-bit/etc/fluent-bit.conf"
+          volumeMounts:
+            - name: odoo-logs
+              mountPath: /var/log/app
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+      # ─── VOLUMES du pod ────────────────────────────────────────────────────
+      volumes:
+        - name: odoo-data
+          emptyDir: {}
+          # Sprint : donnees ephemeres. Production : remplacer par un PVC.
+        - name: odoo-logs
+          emptyDir: {}
+        - name: fluent-bit-config
+          configMap:
+            name: fluent-bit-config
+
+# =============================================================================
+# NOTE : le conteneur Odoo lit le nom de la base via l'argument "-d odoo_db".
+# Si vous preferez le passer par variable d'environnement plutot qu'en dur,
+# Odoo n'a pas de variable native DB_NAME : le nom de base se passe par -d.
+# Le flag -d est donc la bonne approche ici.
+# =============================================================================

@@ -1,0 +1,37 @@
+# =============================================================================
+# SERVICE — Point d'accès stable vers les pods Odoo
+# =============================================================================
+#
+# Ce Service expose l'application Odoo à l'intérieur du cluster.
+# Il est la cible de l'Ingress Controller (voir 08-ingress.yaml).
+#
+# Flux du trafic entrant :
+#   Internet → Ingress Controller → Service odoo-svc → Pod Odoo (port 8069)
+#
+# Pourquoi pas directement Ingress → Pod ?
+#   L'Ingress ne connaît pas les IPs des pods (elles changent).
+#   Il envoie le trafic vers le Service, qui gère l'IP stable et le routing.
+#   Si demain on scale à 3 réplicas Odoo, le Service fait le load-balancing
+#   automatiquement entre les 3 pods — sans modifier l'Ingress.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: odoo-svc     # Référencé dans 08-ingress.yaml comme backend du Service
+  namespace: odoo
+  labels:
+    app.kubernetes.io/name: odoo
+spec:
+  type: ClusterIP    # Pas besoin d'exposition directe — l'Ingress s'en charge
+
+  selector:
+    app.kubernetes.io/name: odoo
+    # Sélectionne tous les pods du Deployment Odoo
+    # Un pod est sélectionné si ET SEULEMENT SI il porte TOUS les labels du selector
+
+  ports:
+    - name: http
+      port: 8069         # Port du Service (visible côté Ingress/client interne)
+      targetPort: 8069   # Port sur le conteneur odoo (containerPort déclaré dans le Deployment)
+      protocol: TCP

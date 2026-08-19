@@ -1,0 +1,83 @@
+# =============================================================================
+# CONFIGMAP — Configuration de Fluent Bit (collecteur de logs)
+# =============================================================================
+#
+# Fluent Bit est un collecteur de logs open-source ultra-léger (Apache 2.0).
+# Site : https://fluentbit.io / Image : fluent/fluent-bit
+#
+# PATTERN SIDECAR — pourquoi un conteneur de logs dans le même pod ?
+# ─────────────────────────────────────────────────────────────────
+# Les conteneurs d'un même pod partagent :
+#   ✓ Le même réseau (localhost entre eux)
+#   ✓ Les mêmes volumes (un sidecar peut lire les fichiers de log du conteneur principal)
+#   ✗ Ils ne partagent PAS les processus ni le filesystem racine
+#
+# Dans ce sprint, Fluent Bit tourne dans le même pod que PostgreSQL/Odoo.
+# Il accède aux logs via un volume partagé de type emptyDir.
+# PostgreSQL écrit dans /var/log/postgresql/, Fluent Bit lit ces fichiers
+# et les envoie vers stdout (visible via kubectl logs).
+#
+# NOTE — Ce pattern n'est plus la recommandation principale en 2024 :
+#   La pratique moderne est d'écrire vers stdout/stderr et de laisser
+#   un DaemonSet Fluent Bit sur chaque nœud collecter les logs de TOUS les pods.
+#   Mais le pattern sidecar reste pertinent quand :
+#     - L'application écrit dans des fichiers (et non vers stdout)
+#     - On veut un enrichissement ou un filtrage par application
+#     - On n'a pas la main sur le DaemonSet du cluster
+#
+# Ce ConfigMap est partagé entre le sidecar PostgreSQL et le sidecar Odoo.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: odoo
+data:
+  # ─── Configuration principale de Fluent Bit ───────────────────────────────
+  fluent-bit.conf: |
+    # IMPORTANT : format INI de Fluent Bit — les commentaires # doivent être
+    # sur leur propre ligne. Un # après une valeur est inclus dans la valeur
+    # et provoque une erreur de parsing.
+
+    # [SERVICE] : paramètres globaux du daemon
+    [SERVICE]
+        Flush        5
+        Daemon       Off
+        Log_Level    info
+        Parsers_File parsers.conf
+
+    # [INPUT] : lit les fichiers de logs du conteneur principal via le volume partagé
+    # Path /var/log/app/*.log correspond au mountPath du sidecar (pg-logs ou odoo-logs)
+    # Read_from_Head True : relit depuis le début du fichier à chaque démarrage du pod
+    [INPUT]
+        Name             tail
+        Path             /var/log/app/*.log
+        Tag              app.logs
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    # [OUTPUT] : envoie les logs vers stdout
+    # Visible via : kubectl logs <pod> -c log-exporter -n odoo
+    # En production : remplacer par loki, es (Elasticsearch), cloudwatch...
+    [OUTPUT]
+        Name   stdout
+        Match  *
+        Format json_lines
+
+  # ─── Parsers personnalisés ─────────────────────────────────────────────────
+  parsers.conf: |
+    # Parser pour les logs PostgreSQL (format : YYYY-MM-DD HH:MM:SS.mmm UTC [PID] LEVEL: message)
+    [PARSER]
+        Name        postgresql
+        Format      regex
+        Regex       ^(?<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3} \w+) \[(?<pid>\d+)\] (?<level>\w+):\s+(?<message>.+)$
+        Time_Key    time
+        Time_Format %Y-%m-%d %H:%M:%S.%L %Z
+
+    # Parser pour les logs JSON (applications modernes comme Quarkus/Spring Boot)
+    [PARSER]
+        Name        json
+        Format      json
+        Time_Key    timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S.%L

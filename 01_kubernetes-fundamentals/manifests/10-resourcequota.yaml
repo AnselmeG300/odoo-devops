@@ -1,0 +1,87 @@
+# =============================================================================
+# RESOURCEQUOTA + LIMITRANGE — Gouvernance des ressources du namespace
+# =============================================================================
+#
+# Problème sans limites :
+#   Un pod mal configuré (boucle infinie, fuite mémoire) peut consommer
+#   toutes les ressources d'un nœud et affecter TOUS les autres pods du cluster.
+#
+# Deux mécanismes complémentaires :
+#
+#   ResourceQuota : limite GLOBALE du namespace entier.
+#     "La somme de toutes les ressources de tous les pods du namespace
+#      ne peut pas dépasser ces valeurs."
+#     → Protège le cluster des namespaces trop gourmands.
+#
+#   LimitRange : valeurs par CONTENEUR.
+#     "Chaque conteneur doit respecter ces bornes min/max/default."
+#     → Protège contre les oublis de configuration de ressources.
+#     Si un conteneur ne déclare pas de limits → LimitRange applique les défauts.
+#
+# Unités :
+#   CPU    : exprimé en millicores. 1000m = 1 vCPU. 250m = 1/4 de vCPU.
+#   Mémoire: Mi (mébioctets, base 2) ou Gi. 1Gi = 1024Mi.
+#
+# Différence requests vs limits :
+#   requests : garanti par le scheduler (le pod est placé sur un nœud
+#              qui a au moins autant de disponible).
+#   limits   : maximum absolu (CPU throttlé, RAM → OOMKilled si dépassé).
+# =============================================================================
+
+---
+# ─── RESOURCEQUOTA : plafond global du namespace ──────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: odoo-quota
+  namespace: odoo
+spec:
+  hard:
+    pods: "10"
+    # Maximum 10 pods dans ce namespace au total (init containers + sidecars compris)
+
+    requests.cpu: "2"
+    # La somme des requests.cpu de tous les conteneurs ne peut pas dépasser 2 vCPU
+
+    requests.memory: 2Gi
+    # La somme des requests.memory de tous les conteneurs ne peut pas dépasser 2 Gi
+
+    limits.cpu: "4"
+    # La somme des limits.cpu ne peut pas dépasser 4 vCPU
+
+    limits.memory: 4Gi
+    # La somme des limits.memory ne peut pas dépasser 4 Gi
+
+    persistentvolumeclaims: "5"
+    # Maximum 5 PVCs dans ce namespace (évite la consommation excessive de stockage)
+
+---
+# ─── LIMITRANGE : bornes par conteneur ────────────────────────────────────────
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: odoo-limitrange
+  namespace: odoo
+spec:
+  limits:
+    - type: Container    # S'applique à chaque conteneur individuellement
+                         # (Autres types : Pod, PersistentVolumeClaim)
+
+      # Valeurs appliquées automatiquement si un conteneur ne les déclare pas
+      default:
+        cpu: 500m        # Limite CPU par défaut
+        memory: 512Mi    # Limite mémoire par défaut
+
+      defaultRequest:
+        cpu: 100m        # Request CPU par défaut
+        memory: 128Mi    # Request mémoire par défaut
+
+      # Valeurs maximales qu'un conteneur peut demander/limiter
+      max:
+        cpu: "2"         # Un conteneur ne peut pas demander plus de 2 vCPU
+        memory: 2Gi      # Un conteneur ne peut pas demander plus de 2 Gi
+
+      # Valeurs minimales — en dessous, le pod est refusé
+      min:
+        cpu: 50m         # Un conteneur doit au moins déclarer 0.05 vCPU
+        memory: 64Mi     # Un conteneur doit au moins déclarer 64 Mi

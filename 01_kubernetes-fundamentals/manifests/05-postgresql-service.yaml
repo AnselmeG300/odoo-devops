@@ -1,0 +1,52 @@
+# =============================================================================
+# SERVICE — Point d'accès stable vers les pods PostgreSQL
+# =============================================================================
+#
+# Problème sans Service :
+#   Les pods ont des IPs éphémères qui changent à chaque redémarrage.
+#   Si Odoo stockait l'IP de PostgreSQL, la connexion se casserait dès
+#   que PostgreSQL redémarre.
+#
+# Solution — le Service :
+#   Le Service expose un groupe de pods sous un NOM DNS fixe et une IP virtuelle
+#   stable (ClusterIP). Kubernetes maintient en interne la liste des pods
+#   sains (Endpoints) et fait le load-balancing automatiquement.
+#
+# Comment ça fonctionne :
+#   1. Ce Service a le nom "postgresql-svc"
+#   2. CoreDNS (DNS interne K8s) crée l'entrée : postgresql-svc.odoo.svc.cluster.local
+#   3. Dans le même namespace, le nom court "postgresql-svc" suffit
+#   4. Les pods sélectionnés via le selector sont les Endpoints du Service
+#
+# Types de Service :
+#   - ClusterIP (ce fichier) : accessible uniquement DANS le cluster — idéal pour la BDD
+#   - NodePort    : expose sur un port de chaque nœud (pas recommandé en prod)
+#   - LoadBalancer: crée un Load Balancer cloud (AWS ELB, GCP LB...) — coûteux
+#   - ExternalName: alias DNS vers un service externe au cluster
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-svc   # Ce nom est le nom DNS utilisé par Odoo pour se connecter
+                         # Voir HOST=postgresql-svc dans 01-configmap.yaml
+  namespace: odoo
+  labels:
+    app.kubernetes.io/name: postgresql
+spec:
+  type: ClusterIP
+  # ClusterIP : le Service est accessible uniquement depuis l'intérieur du cluster.
+  # Aucun trafic externe ne peut atteindre la base de données directement.
+  # C'est exactement ce qu'on veut pour une BDD : jamais exposée à Internet.
+
+  selector:
+    app.kubernetes.io/name: postgresql
+    # Kubernetes surveille en continu les pods portant ce label.
+    # Quand un pod sain est trouvé, son IP est ajoutée aux Endpoints du Service.
+    # Si le pod redémarre, l'Endpoint est mis à jour automatiquement.
+
+  ports:
+    - name: postgresql    # Nom du port (optionnel mais recommandé pour la lisibilité)
+      port: 5432          # Port exposé par le Service (côté client)
+      targetPort: 5432    # Port sur lequel le conteneur écoute (containerPort dans le StatefulSet)
+      protocol: TCP

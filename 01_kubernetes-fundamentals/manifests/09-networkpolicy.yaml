@@ -1,0 +1,125 @@
+# =============================================================================
+# NETWORKPOLICIES — Contrôle du trafic réseau entre les pods
+# =============================================================================
+#
+# Par défaut dans Kubernetes : tout le trafic entre pods est AUTORISÉ.
+# N'importe quel pod peut joindre n'importe quel autre pod du cluster.
+# C'est problématique en production (une application compromise peut
+# attaquer les autres, accéder à la base de données des autres équipes, etc.)
+#
+# NetworkPolicy = firewall applicatif au niveau pod.
+# Dès qu'une NetworkPolicy sélectionne un pod, tout le trafic non explicitement
+# autorisé est BLOQUÉ (principe du "deny by default" une fois une policy existe).
+#
+# Deux axes de contrôle :
+#   - Ingress : trafic ENTRANT vers le pod sélectionné
+#   - Egress  : trafic SORTANT depuis le pod sélectionné
+#
+# Sélecteurs disponibles pour les règles :
+#   - podSelector        : pods du MÊME namespace identifiés par leurs labels
+#   - namespaceSelector  : tous les pods d'un namespace identifié par ses labels
+#   - ipBlock            : plage d'IPs CIDR (pour les services externes au cluster)
+#
+# Important : les NetworkPolicies sont addictives (OR logique).
+#   Si deux policies s'appliquent au même pod, les deux ensembles de règles
+#   sont actifs simultanément.
+#
+# Ce fichier définit 2 policies :
+#   1. postgresql-netpol : restreint l'accès à la BDD
+#   2. odoo-netpol       : contrôle le trafic de l'application
+# =============================================================================
+
+---
+# ─── POLICY 1 : PostgreSQL ────────────────────────────────────────────────────
+# Objectif : seule l'application Odoo peut se connecter à PostgreSQL.
+# Aucun autre pod (même dans le même namespace) ne peut joindre la base.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgresql-netpol
+  namespace: odoo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+    # Cette policy s'applique à TOUS les pods portant ce label
+    # (le StatefulSet PostgreSQL et son sidecar Fluent Bit)
+
+  policyTypes:
+    - Ingress   # On contrôle le trafic entrant
+    - Egress    # On contrôle le trafic sortant
+
+  ingress:
+    # Règle : autoriser les connexions TCP sur le port 5432
+    # depuis les pods Odoo UNIQUEMENT (même namespace, label correspondant)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: odoo
+              # Note : podSelector sans namespaceSelector = même namespace uniquement
+      ports:
+        - protocol: TCP
+          port: 5432
+
+  egress:
+    # PostgreSQL n'a pas besoin d'initier des connexions sortantes dans ce sprint.
+    # La règle {} vide autorise TOUT le trafic sortant.
+    # Ajuster si PostgreSQL doit se connecter à une réplication externe.
+    - {}
+
+---
+# ─── POLICY 2 : Odoo ──────────────────────────────────────────────────────────
+# Objectif : Odoo reçoit le trafic HTTP uniquement depuis l'Ingress Controller,
+# et ne peut contacter que PostgreSQL et le DNS en sortie.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: odoo-netpol
+  namespace: odoo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: odoo
+    # S'applique aux pods Odoo (le Deployment et son sidecar Fluent Bit)
+
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Autoriser le trafic HTTP entrant depuis l'Ingress Controller NGINX uniquement.
+    # L'Ingress Controller tourne dans le namespace "ingress-nginx".
+    # On le sélectionne via son namespace (namespaceSelector), pas via ses labels de pod,
+    # car les pods nginx peuvent avoir des noms variables.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+              # Ce label est automatiquement ajouté par Kubernetes sur chaque namespace.
+              # C'est la manière recommandée de référencer un namespace dans une NetworkPolicy.
+      ports:
+        - protocol: TCP
+          port: 8069    # Port HTTP d'Odoo
+
+  egress:
+    # Règle 1 — DNS : autoriser la résolution de noms via CoreDNS
+    # OBLIGATOIRE si on veut que le pod résolve "postgresql-svc" en IP.
+    # CoreDNS tourne dans le namespace kube-system sur les ports 53 UDP et TCP.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53    # DNS standard (réponses courtes)
+        - protocol: TCP
+          port: 53    # DNS pour les réponses longues (rare mais nécessaire)
+
+    # Règle 2 — PostgreSQL : autoriser les connexions vers la base de données
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432

@@ -1,0 +1,75 @@
+# =============================================================================
+# KUSTOMIZATION - Deploiement de toute la stack Sprint 1 en une commande
+# =============================================================================
+#
+# A placer a la racine de sprint1-kubernetes-fundamentals/
+# (au meme niveau que le dossier manifests/).
+#
+# Utilisation :
+#   kubectl kustomize .        -> affiche le YAML assemble sans rien appliquer
+#   kubectl apply -k .         -> applique toute la stack
+#   kubectl delete -k .        -> supprime toute la stack
+#
+# PREREQUIS : l'Ingress controller n'est PAS inclus ici (c'est un composant
+# d'infrastructure, pas une ressource applicative). L'installer AVANT :
+#   kubectl get pods -A | grep -i ingress || \
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/baremetal/deploy.yaml
+#
+# NOTE SUR L'ORDRE : Kustomize envoie toutes les ressources a l'API sans
+# attendre qu'un pod soit Ready avant le suivant. Ce n'est pas un probleme ici :
+# les dependances sont gerees par les mecanismes internes des manifests
+# (initContainer wait-for-postgresql, binding PVC/PV, probes). Les composants
+# se synchronisent d'eux-memes meme si tout part en meme temps.
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Force toutes les ressources namespacees dans le namespace odoo.
+# Sans effet sur les ressources cluster-scoped (le PersistentVolume) et sur
+# l'objet Namespace lui-meme, que Kustomize laisse intacts.
+namespace: odoo
+
+# Labels communs ajoutes aux metadata de toutes les ressources.
+# includeSelectors reste a false (defaut) pour NE PAS modifier les selectors
+# des Deployment/StatefulSet, qui sont immuables une fois crees.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: odoo-stack
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+
+# Ordre logique des ressources. Kustomize a son propre ordre interne
+# (namespaces et ressources cluster en premier), mais on garde une liste
+# lisible qui suit la progression du sprint.
+resources:
+  # 1. Namespace
+  - manifests/00-namespace.yaml
+
+  # 2. Configuration du collecteur de logs (avant les pods qui en dependent)
+  - manifests/04b-fluent-bit-config.yaml
+
+  # 3. Configuration et credentials applicatifs
+  - manifests/01-configmap.yaml
+  - manifests/02-secret.yaml
+
+  # 4. Stockage (PV cluster-scoped puis PVC namespace)
+  - manifests/03a-pv.yaml
+  - manifests/03-pvc.yaml
+
+  # 5. Base de donnees
+  - manifests/04-postgresql-statefulset.yaml
+  - manifests/05-postgresql-service.yaml
+
+  # 6. Application Odoo (le deployment doit initialiser la base via initContainer)
+  - manifests/06-odoo-deployment.yaml
+  - manifests/07-odoo-service.yaml
+
+  # 7. Exposition
+  - manifests/08-ingress.yaml
+
+  # 8. Securite reseau
+  - manifests/09-networkpolicy.yaml
+
+  # 9. Quota de ressources du namespace
+  - manifests/10-resourcequota.yaml

@@ -1,0 +1,28 @@
+# =============================================================================
+# NAMESPACE — Isolation des ressources
+# =============================================================================
+#
+# Un Namespace est un espace de noms logique dans Kubernetes.
+# Il permet d'isoler les ressources d'un projet ou d'une application
+# des autres workloads qui tournent sur le même cluster physique.
+#
+# Bonnes pratiques :
+#   - Un namespace par application (ou par équipe, selon la taille du cluster)
+#   - Les NetworkPolicies, Quotas et RBAC s'appliquent au niveau du namespace
+#   - Les noms de Service sont accessibles entre pods du MÊME namespace
+#     sans qualification, mais nécessitent le suffixe .<namespace>.svc
+#     pour être joignables depuis un autre namespace.
+#
+# Dans ce sprint : tout sera déployé dans le namespace "odoo"
+# =============================================================================
+
+apiVersion: v1          # Version de l'API Kubernetes pour cet objet
+kind: Namespace         # Type d'objet : ici un Namespace
+metadata:
+  name: odoo            # Nom du namespace — sera utilisé dans tous les autres manifests
+  labels:
+    # Les labels permettent de sélectionner/filtrer les ressources
+    # Le label kubernetes.io/metadata.name est automatiquement ajouté par K8s
+    # mais on peut en ajouter d'autres pour nos propres besoins
+    app.kubernetes.io/name: odoo
+    environment: lab    # Utile pour distinguer les environnements (lab, dev, prd)

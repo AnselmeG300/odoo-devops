@@ -1,0 +1,55 @@
+# =============================================================================
+# PERSISTENTVOLUMECLAIM (PVC) — Réservation de stockage persistant
+# =============================================================================
+#
+# Problème sans PVC :
+#   Par défaut, le système de fichiers d'un conteneur est éphémère.
+#   Si le pod PostgreSQL redémarre, toutes les données de la base sont perdues.
+#
+# Solution — le trio PV / PVC / StorageClass :
+#   - PersistentVolume (PV)      : le stockage physique (disque, NFS, EBS...)
+#   - PersistentVolumeClaim (PVC): la demande de stockage faite par le pod
+#   - StorageClass               : le "type" de stockage (gp3, standard, nfs...)
+#
+#   Le PVC est comme un bon de commande : tu déclares combien de stockage tu veux
+#   et quel mode d'accès. Kubernetes trouve (ou crée via StorageClass) un PV
+#   qui correspond et le "bind" à ton PVC.
+#
+# Mode d'accès ReadWriteOnce :
+#   Le volume peut être monté en lecture/écriture par UN SEUL nœud à la fois.
+#   Adapté aux bases de données single-instance (PostgreSQL, MySQL).
+#   Autres modes :
+#     - ReadWriteMany  : plusieurs nœuds peuvent écrire simultanément (NFS)
+#     - ReadOnlyMany   : plusieurs nœuds peuvent lire (configs partagées)
+#
+# Cycle de vie :
+#   Le PVC (et les données) survivent à la suppression du pod.
+#   Les données ne sont perdues que si le PVC lui-même est supprimé.
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgresql-pvc  # Référencé dans le StatefulSet (volumes.persistentVolumeClaim)
+  namespace: odoo
+spec:
+  accessModes:
+    - ReadWriteOnce     # Un seul nœud peut monter ce volume en écriture à la fois
+
+  resources:
+    requests:
+      storage: 2Gi      # On réserve 2 Go — suffisant pour un sprint d'apprentissage
+                        # En production : dimensionner selon la croissance des données
+
+  storageClassName: manual
+  # "manual" = aucun provisionner automatique.
+  # Ce PVC ne sera bindé qu'avec un PV qui a AUSSI storageClassName: manual.
+  # Notre PV est défini dans 03a-pv.yaml — il doit être appliqué EN PREMIER.
+  #
+  # Ordre obligatoire sur KillerCoda (pas de provisionner local-path actif) :
+  #   kubectl apply -f manifests/03a-pv.yaml   ← crée le PV
+  #   kubectl apply -f manifests/03-pvc.yaml   ← PVC trouve le PV → Bound
+  #
+  # Sur AWS EKS avec StorageClass "gp3" active :
+  #   Supprimer storageClassName ou mettre "gp3" → le PV est créé automatiquement
+  #   (le manifest 03a-pv.yaml ne serait alors pas nécessaire)

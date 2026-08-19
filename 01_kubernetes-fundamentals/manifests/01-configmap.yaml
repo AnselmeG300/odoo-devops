@@ -1,0 +1,55 @@
+# =============================================================================
+# CONFIGMAP — Configuration non sensible de l'application
+# =============================================================================
+#
+# Un ConfigMap stocke des données de configuration sous forme de paires clé/valeur.
+# Il est conçu pour les données NON SENSIBLES (URLs, ports, noms de base, flags).
+# Pour les mots de passe et tokens, utiliser un Secret (voir 02-secret.yaml).
+#
+# Avantage : le ConfigMap est découplé du code de l'image.
+# Changer une valeur de config ne nécessite pas de rebuilder l'image,
+# seulement de mettre à jour le ConfigMap et redémarrer les pods.
+#
+# Comment les pods consomment ce ConfigMap :
+#   - Via des variables d'environnement (env.valueFrom.configMapKeyRef)
+#   - Via un volume monté comme fichier (volumeMounts + volumes.configMap)
+#   Ce sprint utilise la première méthode (variables d'env).
+#
+# Contenu : paramètres de connexion entre Odoo et PostgreSQL
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: odoo-config     # Nom référencé dans les Deployments/StatefulSets
+  namespace: odoo       # Même namespace que les pods qui vont l'utiliser
+data:
+  # --- Paramètres PostgreSQL (utilisés par le conteneur postgresql) ---
+
+  POSTGRES_DB: odoo_db
+  # Nom de la base de données créée automatiquement au premier démarrage de PostgreSQL
+
+  POSTGRES_HOST: postgresql-svc
+  # Nom DNS du Service Kubernetes qui expose PostgreSQL.
+  # Dans le même namespace, le nom court "postgresql-svc" suffit.
+  # Kubernetes résout automatiquement ce nom via CoreDNS.
+
+  POSTGRES_PORT: "5432"
+  # Port standard PostgreSQL. Les valeurs ConfigMap sont toujours des strings,
+  # d'où les guillemets autour du nombre.
+
+  # --- Paramètres Odoo (utilisés par le conteneur odoo) ---
+
+  HOST: postgresql-svc
+  # Odoo utilise la variable HOST pour se connecter à sa base de données.
+  # Pointe vers le même Service que POSTGRES_HOST.
+
+  PORT: "5432"
+  # Port de la base de données, vu du côté Odoo.
+
+  USER: odoo_user
+  # Nom de l'utilisateur PostgreSQL créé pour Odoo.
+  # Le mot de passe correspondant est dans le Secret (02-secret.yaml).
+
+  DB: odoo_db
+  # Nom de la base de données Odoo — identique à POSTGRES_DB.

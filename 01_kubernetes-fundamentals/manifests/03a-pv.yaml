@@ -1,0 +1,113 @@
+# =============================================================================
+# PERSISTENTVOLUME (PV) — Le stockage physique côté cluster
+# =============================================================================
+#
+# Relation PV / PVC / StorageClass — le trio du stockage K8s
+# ─────────────────────────────────────────────────────────────
+#
+#   PersistentVolume (PV)
+#     → Représente un morceau de stockage RÉEL dans le cluster
+#       (disque local, volume EBS AWS, NFS, Ceph, etc.)
+#     → Créé par l'administrateur du cluster OU automatiquement
+#       par une StorageClass (provisionning dynamique)
+#     → Cycle de vie INDÉPENDANT des pods qui l'utilisent
+#
+#   PersistentVolumeClaim (PVC) — voir 03-pvc.yaml
+#     → La DEMANDE de stockage faite par une application
+#     → "Je veux 2 Go en ReadWriteOnce"
+#     → Kubernetes trouve un PV compatible et les "bind" ensemble
+#
+#   StorageClass
+#     → Définit un TYPE de stockage et un provisionneur automatique
+#     → Exemples : "gp3" (SSD EBS sur AWS), "standard" (KillerCoda)
+#
+# Deux modes de provisionning :
+# ─────────────────────────────
+#
+#   STATIQUE (ce fichier) :
+#     L'administrateur crée manuellement les PV avant que les applications
+#     les réclament. La PVC trouve un PV compatible et s'y bind.
+#     Ordre : PV → PVC → Pod
+#
+#                  Admin crée       App réclame
+#                  ┌────────┐       ┌────────┐
+#                  │   PV   │ ←──── │  PVC   │ ←── Pod
+#                  └────────┘  bind └────────┘
+#
+#   DYNAMIQUE (recommandé en production) :
+#     La PVC référence une StorageClass. Le provisionneur de la StorageClass
+#     crée automatiquement un PV correspondant à la demande.
+#     Ordre : StorageClass → PVC crée automatiquement un PV → Pod
+#
+#                  ┌──────────────┐
+#                  │ StorageClass │ (gp3, standard, nfs...)
+#                  └──────┬───────┘
+#                         │ provisionne automatiquement
+#                         ▼
+#                  ┌────────┐       ┌────────┐
+#                  │   PV   │ ←──── │  PVC   │ ←── Pod
+#                  └────────┘  bind └────────┘
+#
+# Sur KillerCoda :
+#   Le cluster a une StorageClass "standard" avec provisionning dynamique.
+#   Le PV ci-dessous est donc créé pour COMPRENDRE le concept,
+#   mais en pratique le PVC du fichier 03-pvc.yaml crée son PV automatiquement.
+#
+# Politique de récupération (reclaimPolicy) :
+#   - Retain  : le PV et ses données sont conservés après suppression du PVC
+#               (l'admin doit nettoyer manuellement)
+#   - Delete  : le PV ET les données sont supprimés avec le PVC
+#               (défaut sur les StorageClass cloud — attention !)
+#   - Recycle : dépréciée
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgresql-pv
+  # Nom global au cluster (les PV ne sont PAS dans un namespace)
+  # Un PV est une ressource CLUSTER-SCOPED, contrairement aux PVC qui sont namespace-scoped
+  labels:
+    app.kubernetes.io/name: postgresql
+    type: local             # Indique que c'est du stockage local (hostPath)
+spec:
+
+  capacity:
+    storage: 2Gi            # Capacité totale de ce PV
+                            # Doit être >= à la demande du PVC (03-pvc.yaml demande 2Gi)
+
+  accessModes:
+    - ReadWriteOnce         # Ce PV peut être monté en lecture/écriture par UN SEUL nœud
+                            # Doit correspondre au mode déclaré dans le PVC
+
+  persistentVolumeReclaimPolicy: Retain
+  # Retain : si le PVC est supprimé, ce PV et ses données sont CONSERVÉS
+  # L'administrateur doit manuellement nettoyer ou réaffecter le PV
+  # Recommandé pour les bases de données (évite les suppressions accidentelles)
+
+  storageClassName: manual
+  # Identifiant de la "classe" de ce PV.
+  # Le PVC doit référencer le même storageClassName pour matcher ce PV.
+  # "manual" = aucun provisionneur automatique, création manuelle uniquement.
+  # Sur KillerCoda : utiliser "standard" à la place pour le provisionning dynamique.
+
+  hostPath:
+    path: /mnt/data/postgresql
+    # hostPath monte un répertoire du NŒUD Kubernetes dans le pod.
+    # Utilisé ici pour simplifier le lab (pas besoin d'infra externe).
+    #
+    # ATTENTION — hostPath en production :
+    #   ✗ Pas de réplication : les données sont sur UN SEUL nœud
+    #   ✗ Si le pod est replanifié sur un autre nœud → perte de données
+    #   ✗ Problèmes de permissions selon le système de fichiers hôte
+    #
+    # En production, remplacer par :
+    #   - awsElasticBlockStore (EBS sur AWS)
+    #   - gcePersistentDisk (GCE sur GCP)
+    #   - nfs (partage réseau)
+    #   - ou laisser la StorageClass créer le PV dynamiquement
+
+  # Optionnel : lier ce PV à un PVC spécifique (évite qu'un autre PVC le prenne)
+  # claimRef:
+  #   namespace: odoo
+  #   name: postgresql-pvc

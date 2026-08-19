@@ -1,0 +1,60 @@
+# =============================================================================
+# INGRESS - Exposition de l'application vers l'exterieur du cluster
+# =============================================================================
+#
+# Deux regles de routage :
+#   1. host: odoo.lab.local -> conformite pedagogique, routage par Host
+#   2. sans host            -> matche n'importe quel Host, necessaire pour
+#      l'acces via le proxy Killercoda qui ne transmet pas le header
+#      "Host: odoo.lab.local". Sans cette regle, l'acces navigateur via
+#      l'URL Killercoda renvoie un 404 du controller (aucune regle host
+#      ne matche).
+#
+# Prerequis : un Ingress controller nginx doit tourner dans le cluster
+# (namespace ingress-nginx). Sans controller, cet objet reste inerte.
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: odoo-ingress
+  namespace: odoo
+  annotations:
+    # Pas de limite de taille de requete (uploads Odoo : pieces jointes, images)
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # Timeouts longs pour les operations Odoo (rapports, imports)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+
+  rules:
+    # --- Regle 1 : routage par Host (conformite pedagogique) ---
+    - host: odoo.lab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: odoo-svc
+                port:
+                  number: 8069
+
+    # --- Regle 2 : sans host, matche tout (acces via proxy Killercoda) ---
+    # A retirer en production : n'existe que pour contourner l'absence de
+    # header Host dans le proxy Killercoda.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: odoo-svc
+                port:
+                  number: 8069
+
+  # ─── TLS - Activer en production avec cert-manager ─────────────────────────
+  # tls:
+  #   - hosts:
+  #       - odoo.mondomaine.com
+  #     secretName: odoo-tls

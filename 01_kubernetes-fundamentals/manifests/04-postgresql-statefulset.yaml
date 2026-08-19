@@ -1,0 +1,211 @@
+# =============================================================================
+# STATEFULSET — Déploiement de PostgreSQL avec sidecar Fluent Bit
+# =============================================================================
+#
+# Pourquoi StatefulSet plutôt que Deployment ?
+# ─────────────────────────────────────────────
+# Un Deployment convient aux applications SANS ÉTAT (stateless) qui peuvent être
+# redémarrées n'importe où, dans n'importe quel ordre, avec un nom de pod aléatoire.
+#
+# Un StatefulSet garantit pour chaque réplica :
+#   ✓ Un NOM STABLE et prévisible : postgresql-0, postgresql-1, ...
+#   ✓ Un ORDRE de démarrage/arrêt : 0 avant 1, 1 avant 2, etc.
+#   ✓ Une IDENTITÉ RÉSEAU stable : le nom DNS postgresql-0.postgresql-svc
+#     survit aux redémarrages du pod
+#
+# Pour une base de données, ces garanties sont essentielles :
+#   - PostgreSQL en mode réplication a besoin de savoir quel pod est le primaire
+#   - Les clients qui stockent la connexion ouverte retrouvent le bon pod après redémarrage
+#
+# Structure de ce pod — DEUX conteneurs (pattern sidecar) :
+# ─────────────────────────────────────────────────────────
+#   1. postgresql     → conteneur principal, gère la base de données
+#   2. log-exporter   → sidecar Fluent Bit, collecte et exporte les logs
+#
+# Les deux conteneurs partagent le volume "pg-logs" (emptyDir).
+# PostgreSQL y écrit ses logs, Fluent Bit les lit et les envoie vers stdout.
+# =============================================================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: odoo
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/instance: postgresql
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgresql-svc  # Doit correspondre au nom du Service headless
+                                # C'est ce qui crée le DNS stable postgresql-0.postgresql-svc
+
+  replicas: 1     # Une seule instance pour ce sprint
+                  # En production avec réplication : augmenter et configurer le mode HA
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql  # Le StatefulSet gère les pods portant ces labels
+
+  template:       # Template du pod — appliqué à chaque réplica
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgresql
+        app.kubernetes.io/instance: postgresql
+        app.kubernetes.io/component: database
+
+    spec:
+      # Contexte de sécurité du POD entier (s'applique à tous les conteneurs)
+      securityContext:
+        fsGroup: 999  # GID du groupe "postgres" dans l'image officielle
+                      # Permet à PostgreSQL d'écrire dans le volume monté (le PVC)
+                      # sans avoir besoin d'être root
+
+      # ─── CONTENEUR PRINCIPAL : PostgreSQL ──────────────────────────────────
+      containers:
+        - name: postgresql
+          image: postgres:14    # Image officielle PostgreSQL 14 (Docker Hub)
+                                # En production : utiliser une version fixe (ex: 14.11)
+          ports:
+            - containerPort: 5432
+              name: postgresql  # Nom du port, référencé dans le Service et les NetworkPolicies
+
+          # Variables d'environnement injectées depuis ConfigMap et Secret
+          env:
+            - name: POSTGRES_DB         # Nom de la BDD créée au premier démarrage
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: POSTGRES_DB
+
+            - name: POSTGRES_USER       # Utilisateur propriétaire de la BDD
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: USER
+
+            - name: POSTGRES_PASSWORD   # Mot de passe — vient du Secret (pas du ConfigMap)
+              valueFrom:
+                secretKeyRef:
+                  name: odoo-secret
+                  key: POSTGRES_PASSWORD
+
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+              # Sous-répertoire du volume pour les données PostgreSQL.
+              # Le dossier parent /var/lib/postgresql/data peut contenir des fichiers
+              # du système de fichiers hôte qui bloqueraient l'init de PostgreSQL.
+              # L'utilisation d'un sous-dossier évite ce problème.
+
+          # Configuration de la journalisation PostgreSQL
+          # Redirige les logs vers des fichiers lisibles par le sidecar Fluent Bit
+          args:
+            - "-c"
+            - "logging_collector=on"    # Active la collecte des logs dans des fichiers
+            - "-c"
+            - "log_directory=/var/log/postgresql"
+            - "-c"
+            - "log_filename=postgresql.log"
+            - "-c"
+            - "log_statement=none"      # Ne pas logger toutes les requêtes (trop verbeux)
+            - "-c"
+            - "log_connections=on"      # Logger les connexions (utile pour le debug)
+
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+              # Volume persistant — les données survivent aux redémarrages du pod
+
+            - name: pg-logs
+              mountPath: /var/log/postgresql
+              # Volume partagé avec le sidecar — PostgreSQL écrit ici,
+              # Fluent Bit lit ici. Type emptyDir : vide au démarrage du pod,
+              # supprimé quand le pod est détruit.
+
+          # LIVENESS PROBE — Kubernetes vérifie si le conteneur est vivant
+          # Si cette probe échoue N fois de suite → le conteneur est redémarré
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "odoo_user", "-d", "odoo_db"]
+              # pg_isready retourne 0 si PostgreSQL accepte des connexions
+            initialDelaySeconds: 30   # Attend 30s avant la première vérification
+                                      # (PostgreSQL a besoin de temps pour démarrer)
+            periodSeconds: 10         # Vérifie toutes les 10 secondes
+            failureThreshold: 6       # 6 échecs consécutifs → redémarrage
+
+          # READINESS PROBE — Kubernetes vérifie si le conteneur peut recevoir du trafic
+          # Si cette probe échoue → le pod est retiré du Service (plus de trafic envoyé)
+          # Différence avec liveness : ici pas de redémarrage, juste isolation du trafic
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "odoo_user", "-d", "odoo_db"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+          resources:
+            requests:
+              cpu: 200m       # 0.2 vCPU garanti au pod
+              memory: 256Mi   # 256 Mo RAM garantis
+            limits:
+              cpu: 500m       # Ne peut pas dépasser 0.5 vCPU
+              memory: 512Mi   # Ne peut pas dépasser 512 Mo RAM
+              # Si la limite mémoire est dépassée → OOMKilled (Out Of Memory)
+
+      # ─── CONTENEUR SIDECAR : Fluent Bit (collecteur de logs) ──────────────
+        - name: log-exporter
+          image: fluent/fluent-bit:2.1.10
+          # Fluent Bit : collecteur de logs léger open-source (Apache 2.0)
+          # https://fluentbit.io
+          # L'image fait ~30 Mo — impact minimal sur le pod
+
+          # Pourquoi ce sidecar dans le même pod et pas ailleurs ?
+          # ────────────────────────────────────────────────────────
+          # 1. Accès aux fichiers de logs via un volume partagé (emptyDir pg-logs)
+          #    Un pod externe n'aurait pas accès à ces fichiers.
+          # 2. Même cycle de vie : si PostgreSQL est arrêté, le sidecar l'est aussi.
+          #    Cohérence garantie entre les logs et l'application qui les génère.
+          # 3. Co-localisation réseau : le sidecar peut joindre PostgreSQL via localhost
+          #    pour des métriques ou health checks si nécessaire.
+
+          args:
+            - "-c"
+            - "/fluent-bit/etc/fluent-bit.conf"  # Charge notre configuration personnalisée
+
+          volumeMounts:
+            - name: pg-logs
+              mountPath: /var/log/app
+              # Monte le répertoire de logs PostgreSQL sous /var/log/app
+              # Correspond au chemin "Path" dans la section [INPUT] du ConfigMap Fluent Bit
+
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc
+              # Monte la configuration Fluent Bit depuis le ConfigMap 04b-fluent-bit-config.yaml
+              # Fluent Bit lit fluent-bit.conf et parsers.conf depuis ce dossier
+
+          resources:
+            requests:
+              cpu: 50m        # Fluent Bit est très léger — 0.05 vCPU suffit
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+      # ─── VOLUMES du pod ────────────────────────────────────────────────────
+      volumes:
+        - name: postgresql-data
+          persistentVolumeClaim:
+            claimName: postgresql-pvc
+            # PVC créé dans 03-pvc.yaml
+            # Ce volume est PERSISTANT : les données survivent au redémarrage du pod
+
+        - name: pg-logs
+          emptyDir: {}
+          # Volume ÉPHÉMÈRE partagé entre postgresql et log-exporter
+          # Créé vide au démarrage du pod, supprimé à sa destruction
+          # Rôle : canal de communication par fichiers entre les deux conteneurs
+
+        - name: fluent-bit-config
+          configMap:
+            name: fluent-bit-config
+            # Monte le ConfigMap créé dans 04b-fluent-bit-config.yaml
+            # Chaque clé du ConfigMap devient un fichier dans le répertoire
+            # fluent-bit.conf et parsers.conf seront montés dans /fluent-bit/etc/
