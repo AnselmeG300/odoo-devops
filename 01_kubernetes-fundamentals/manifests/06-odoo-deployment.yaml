@@ -2,23 +2,32 @@
 # DEPLOYMENT - Application Odoo avec init containers et sidecar Fluent Bit
 # =============================================================================
 #
-# Correctifs apportes par rapport a la version initiale :
-#   1. Ajout d'un initContainer "odoo-db-init" qui initialise le schema
-#      de la base AVANT le demarrage du conteneur principal.
-#      Cause racine du bug precedent : "-i base" sans "-d <base>" n'initialise
-#      rien, d'ou les erreurs KeyError 'ir.http' et
-#      relation "ir_module_module" does not exist, puis la boucle de restart.
-#   2. Le conteneur principal ne fait plus l'init : il sert juste l'application
+# Correctifs apportes :
+#   1. initContainer "odoo-db-init" qui initialise le schema de la base AVANT
+#      le conteneur principal. Corrige le bug d'origine ("-i base" sans
+#      "-d odoo_db" n'initialise rien : KeyError 'ir.http',
+#      relation "ir_module_module" does not exist, puis boucle de restart).
+#   2. Le conteneur principal ne fait plus l'init : il sert l'application
 #      avec "-d odoo_db".
-#   3. Ajout d'une startupProbe pour couvrir le temps de demarrage d'Odoo
-#      sans que la livenessProbe ne tue le pod trop tot.
-#   4. Ajout de la cle DB_NAME cote ConfigMap (voir note en bas de fichier).
+#   3. startupProbe pour couvrir le demarrage d'Odoo sans que la livenessProbe
+#      ne tue le pod trop tot.
+#   4. requests/limits de "wait-for-postgresql" releves au plancher impose par
+#      le LimitRange du namespace (min 50m CPU / 64Mi memoire par conteneur).
+#      Avant : 10m/16Mi -> refuse par le LimitRange, aucun pod cree
+#      (Error FailedCreate: minimum cpu usage per Container is 50m...).
+#   5. Image alignee sur odoo:19.0 pour l'init ET le conteneur principal.
+#      Init et service doivent utiliser la MEME version, sinon risque d'erreur
+#      de migration de schema (init en 16, service en 19).
 #
 # Structure du pod - QUATRE conteneurs (2 init + 2 principaux) :
 #   1. wait-for-postgresql  -> INIT : attend que la BDD soit joignable (TCP)
 #   2. odoo-db-init         -> INIT : initialise le schema (-i base) puis stop
 #   3. odoo                 -> conteneur principal : l'application
 #   4. log-exporter         -> SIDECAR Fluent Bit : collecte les logs Odoo
+#
+# NOTE sur le LimitRange : il s'applique a TOUS les conteneurs, initContainers
+# compris. Chaque conteneur doit donc respecter le minimum. Verifier les bornes
+# avec : kubectl describe limitrange -n odoo (colonnes Min / Max / Default).
 # =============================================================================
 
 apiVersion: apps/v1
@@ -32,8 +41,8 @@ metadata:
     app.kubernetes.io/component: application
 spec:
   replicas: 1     # Une seule instance pour ce sprint.
-                  # NE PAS mettre plus d'1 replica tant que l'init se fait dans
-                  # un initContainer sur chaque pod : plusieurs pods tenteraient
+                  # NE PAS depasser 1 replica tant que l'init se fait dans un
+                  # initContainer sur chaque pod : plusieurs pods tenteraient
                   # d'initialiser la meme base en parallele (race condition).
 
   selector:
@@ -66,11 +75,11 @@ spec:
               echo "PostgreSQL est pret."
           resources:
             requests:
-              cpu: 10m
-              memory: 16Mi
+              cpu: 50m       # aligne sur le minimum du LimitRange (etait 10m)
+              memory: 64Mi   # aligne sur le minimum du LimitRange (etait 16Mi)
             limits:
-              cpu: 50m
-              memory: 32Mi
+              cpu: 100m      # >= requests, et memory limit >= 64Mi (etait 32Mi)
+              memory: 128Mi
 
         # ── Init 2 : initialisation du schema Odoo ──────────────────────────
         # Cible explicitement la base avec "-d odoo_db" (le correctif cle).
@@ -79,7 +88,7 @@ spec:
         # Idempotent : au redemarrage, si la base est deja initialisee,
         # "-i base" est ignore et ce conteneur ressort quasi immediatement.
         - name: odoo-db-init
-          image: odoo:16.0
+          image: odoo:19.0
           args:
             - -d
             - odoo_db
@@ -121,7 +130,7 @@ spec:
 
         # ── Conteneur 1 : Odoo ──────────────────────────────────────────────
         - name: odoo
-          image: odoo:16.0
+          image: odoo:19.0   # alignee sur odoo-db-init (etait 16.0)
           # Plus de "-i base" ici : l'init est faite par l'initContainer.
           # On cible juste la base pour eviter tout auto-select ambigu.
           args:
@@ -167,7 +176,6 @@ spec:
             failureThreshold: 18
 
           # LIVENESS PROBE - le conteneur est-il encore vivant ?
-          # Plus besoin d'initialDelaySeconds : la startupProbe s'en charge.
           livenessProbe:
             httpGet:
               path: /web/health
@@ -209,7 +217,7 @@ spec:
               mountPath: /fluent-bit/etc
           resources:
             requests:
-              cpu: 50m
+              cpu: 50m       # exactement le minimum du LimitRange, conforme
               memory: 64Mi
             limits:
               cpu: 100m
@@ -227,8 +235,11 @@ spec:
             name: fluent-bit-config
 
 # =============================================================================
-# NOTE : le conteneur Odoo lit le nom de la base via l'argument "-d odoo_db".
-# Si vous preferez le passer par variable d'environnement plutot qu'en dur,
-# Odoo n'a pas de variable native DB_NAME : le nom de base se passe par -d.
-# Le flag -d est donc la bonne approche ici.
+# NOTE : le nom de la base est passe via l'argument "-d odoo_db". Odoo n'a pas
+# de variable d'environnement native pour cela, le flag -d est la bonne methode.
+#
+# RAPPEL LimitRange : si le pod refuse encore de se creer apres ces valeurs,
+# lancer "kubectl describe limitrange -n odoo" et verifier :
+#   - Min : chaque requests doit etre >= Min (CPU et memoire)
+#   - Max : chaque limits doit etre <= Max (attention au 1 CPU / 1Gi ci-dessus)
 # =============================================================================
