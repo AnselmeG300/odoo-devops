@@ -1,0 +1,88 @@
+{{/*
+=============================================================================
+SERVICES — Exposition réseau des pods Odoo et PostgreSQL
+=============================================================================
+
+Un Service Kubernetes est un point d'accès réseau STABLE vers un groupe de pods.
+Sans Service : les pods ont des IPs qui changent à chaque redémarrage.
+Avec Service : une IP virtuelle (ClusterIP) et un nom DNS fixes.
+
+Ce fichier crée DEUX Services :
+  1. <release>-svc          → expose Odoo (port 8069) en interne au cluster
+  2. <release>-postgresql-svc → expose PostgreSQL (port 5432) en interne
+
+Pourquoi pas un seul Service ?
+  Odoo et PostgreSQL ont des rôles différents, des sélecteurs différents
+  (app.kubernetes.io/component: odoo vs postgresql) et des règles de sécurité
+  différentes (NetworkPolicy). Les séparer respecte le principe de moindre
+  privilège : seul Odoo connaît l'adresse du Service PostgreSQL.
+
+Types de Service :
+  ClusterIP    : accessible uniquement depuis l'intérieur du cluster (défaut)
+  NodePort     : expose un port sur chaque nœud du cluster
+  LoadBalancer : crée un load balancer cloud (AWS ELB, GCP LB...)
+  ExternalName : alias DNS vers un service externe
+
+Ici on utilise ClusterIP pour les deux — l'accès externe passe par l'Ingress.
+
+Note sur le sélecteur (selector) :
+  Le Service envoie le trafic aux pods dont les labels correspondent à selector.
+  odoo.selectorLabels inclut app.kubernetes.io/name et instance — c'est le minimum
+  stable pour identifier les pods sans dépendre de la version ou du composant.
+  Le label app.kubernetes.io/component permet de distinguer odoo de postgresql.
+=============================================================================
+*/}}
+
+---
+# ─── SERVICE 1 : Odoo ────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "odoo.fullname" . }}-svc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: odoo
+spec:
+  # .Values.service.type permet de basculer en NodePort pour les environnements
+  # sans Ingress Controller (ex: KillerCoda sans nginx)
+  type: {{ .Values.service.type }}
+
+  # selector : le Service route vers les pods qui ont ces labels
+  # Correspondent exactement aux labels définis dans le template du Deployment
+  selector:
+    {{- include "odoo.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: odoo
+
+  ports:
+    - name: http
+      # .Values.service.port (défaut: 8069) → port exposé par le Service
+      # targetPort: 8069 → port écouté par le conteneur Odoo
+      port: {{ .Values.service.port }}
+      targetPort: 8069
+
+---
+# ─── SERVICE 2 : PostgreSQL (headless pour StatefulSet) ──────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "odoo.fullname" . }}-postgresql-svc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  # ClusterIP fixe : accessible uniquement depuis l'intérieur du cluster
+  # Ce service est utilisé par :
+  #   - L'init container d'Odoo (nc -z postgresql-svc 5432)
+  #   - La variable d'environnement HOST dans le ConfigMap
+  type: ClusterIP
+
+  selector:
+    {{- include "odoo.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: 5432

@@ -1,0 +1,185 @@
+{{/*
+=============================================================================
+STATEFULSET — PostgreSQL avec sidecar Fluent Bit
+=============================================================================
+
+Pourquoi ce fichier est différent du Sprint 1 ?
+─────────────────────────────────────────────────
+Sprint 1 : manifeste YAML statique — valeurs codées en dur, une seule instance
+Sprint 2 : template Go — les valeurs viennent de values.yaml ou de -f values-prod.yaml
+
+Syntaxe Go template rappel rapide :
+  {{ .Values.xxx }}          → lit une valeur de values.yaml
+  {{ .Release.Name }}        → nom donné à helm install (ex: "odoo")
+  {{ .Release.Namespace }}   → namespace cible (--namespace ou par défaut)
+  {{ .Chart.AppVersion }}    → version dans Chart.yaml
+  {{ include "tpl" . }}      → appelle un named template défini dans _helpers.tpl
+  {{- ... -}}                → supprime les espaces/sauts de ligne avant/après
+  | nindent N                → indente le bloc de N espaces (nécessaire après include)
+  | quote                    → ajoute des guillemets autour d'une valeur
+  | toYaml                   → sérialise un objet Go en YAML inline
+=============================================================================
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  # include "odoo.fullname" produit : <release-name> (ex: "odoo", "odoo-prod")
+  # Cela rend chaque ressource unique si plusieurs instances sont déployées dans le cluster
+  name: {{ include "odoo.fullname" . }}-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    # odoo.labels (défini dans _helpers.tpl) injecte les labels standards Kubernetes :
+    #   app.kubernetes.io/name, instance, version, managed-by, helm.sh/chart
+    # nindent 4 : indentation de 4 espaces pour s'aligner sous "labels:"
+    {{- include "odoo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  # serviceName doit correspondre au Service headless — crée le DNS stable :
+  #   <pod-name>.<service-name>.<namespace>.svc.cluster.local
+  #   ex : odoo-postgresql-0.odoo-postgresql-svc.odoo.svc.cluster.local
+  serviceName: {{ include "odoo.fullname" . }}-postgresql-svc
+  replicas: 1   # PostgreSQL en mode standalone pour ce sprint
+  selector:
+    matchLabels:
+      # odoo.selectorLabels = subset de labels utilisé UNIQUEMENT pour l'identification
+      # (sans version ni managed-by, pour éviter de "casser" le sélecteur à chaque mise à jour)
+      {{- include "odoo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  template:
+    metadata:
+      labels:
+        {{- include "odoo.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgresql
+    spec:
+      securityContext:
+        fsGroup: 999  # GID du groupe "postgres" dans l'image officielle
+                      # Permet d'écrire dans le PVC sans être root
+
+      # ─── CONTENEUR PRINCIPAL : PostgreSQL ────────────────────────────────────
+      containers:
+        - name: postgresql
+          # .Values.postgresql.image.repository et .tag viennent de values.yaml
+          # En production : surcharger avec une version fixe via -f values-prod.yaml
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: postgresql
+
+          # Configuration de la journalisation PostgreSQL
+          # Redirige les logs vers des fichiers lisibles par le sidecar Fluent Bit
+          args:
+            - "-c"
+            - "logging_collector=on"
+            - "-c"
+            - "log_directory=/var/log/postgresql"
+            - "-c"
+            - "log_filename=postgresql.log"
+            - "-c"
+            - "log_statement=none"
+            - "-c"
+            - "log_connections=on"
+
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  # include génère le nom exact du ConfigMap créé dans configmap.yaml
+                  name: {{ include "odoo.fullname" . }}-config
+                  key: POSTGRES_DB
+
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "odoo.fullname" . }}-config
+                  key: USER
+
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  # Le Secret est créé dans secret.yaml avec le même naming pattern
+                  name: {{ include "odoo.fullname" . }}-secret
+                  key: POSTGRES_PASSWORD
+
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+              # PVC créé dans pvc.yaml — données persistantes
+
+            - name: pg-logs
+              mountPath: /var/log/postgresql
+              # Volume partagé avec le sidecar — PostgreSQL écrit, Fluent Bit lit
+
+          livenessProbe:
+            exec:
+              # | quote entoure la valeur de guillemets pour éviter les erreurs de parsing YAML
+              command: ["pg_isready", "-U", {{ .Values.postgresql.user | quote }}, "-d", {{ .Values.postgresql.database | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgresql.user | quote }}, "-d", {{ .Values.postgresql.database | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+          resources:
+            # toYaml sérialise l'objet .Values.postgresqlResources en YAML
+            # nindent 12 aligne le résultat sous "resources:"
+            # Résultat équivalent à écrire les requests/limits directement ici
+            {{- toYaml .Values.postgresqlResources | nindent 12 }}
+
+      # ─── CONTENEUR SIDECAR : Fluent Bit (collecteur de logs) ─────────────────
+      {{- if .Values.logExporter.enabled }}
+        # Le bloc {{- if ... }} rend le sidecar OPTIONNEL.
+        # Si logExporter.enabled: false dans values.yaml → ce conteneur n'est pas rendu.
+        # C'est la puissance du templating : un seul fichier, plusieurs comportements.
+        - name: log-exporter
+          image: "{{ .Values.logExporter.image.repository }}:{{ .Values.logExporter.image.tag }}"
+          imagePullPolicy: IfNotPresent
+
+          # Pourquoi ce sidecar dans le même pod ?
+          # ────────────────────────────────────────
+          # 1. Partage de volume : accède au répertoire /var/log/postgresql via pg-logs
+          # 2. Cycle de vie lié : s'arrête avec PostgreSQL
+          # 3. Co-localisation : pas de transfert réseau pour les logs
+
+          args:
+            - "-c"
+            - "/fluent-bit/etc/fluent-bit.conf"
+
+          volumeMounts:
+            - name: pg-logs
+              mountPath: /var/log/app
+              # Lit les fichiers que PostgreSQL a écrits dans /var/log/postgresql
+
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc
+              # Configuration Fluent Bit depuis le ConfigMap fluent-bit-config
+
+          resources:
+            {{- toYaml .Values.logExporter.resources | nindent 12 }}
+      {{- end }}
+
+      # ─── VOLUMES du pod ───────────────────────────────────────────────────────
+      volumes:
+        - name: postgresql-data
+          persistentVolumeClaim:
+            # Référence le PVC créé dans pvc.yaml — même naming pattern
+            claimName: {{ include "odoo.fullname" . }}-postgresql-pvc
+
+        - name: pg-logs
+          emptyDir: {}
+          # Volume éphémère partagé entre postgresql et log-exporter
+          # Créé vide au démarrage du pod, détruit à sa suppression
+
+        {{- if .Values.logExporter.enabled }}
+        - name: fluent-bit-config
+          configMap:
+            # ConfigMap créé dans fluent-bit-config.yaml
+            name: {{ include "odoo.fullname" . }}-fluent-bit-config
+        {{- end }}

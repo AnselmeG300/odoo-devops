@@ -1,0 +1,80 @@
+{{/*
+=============================================================================
+INGRESS — Exposition HTTP/HTTPS vers l'extérieur du cluster
+=============================================================================
+
+L'Ingress est la "porte d'entrée" du cluster pour le trafic HTTP.
+Il définit des règles de routage : quel hostname/path → quel Service.
+L'Ingress Controller (NGINX ici) lit ces règles et configure son proxy dynamiquement.
+
+Architecture :
+  Internet → LoadBalancer (1 seule IP) → NGINX Ingress Controller → Service Odoo
+
+Ce template illustre 3 concepts Go template avancés :
+
+  1. Bloc conditionnel principal {{- if .Values.ingress.enabled }}
+     → tout ce fichier est optionnel. Si enabled: false, rien n'est rendu.
+     Utile pour désactiver l'Ingress en local ou dans des environnements internes.
+
+  2. Bloc conditionnel imbriqué {{- if .Values.ingress.tls.enabled }}
+     → la section TLS n'apparaît que si TLS est activé dans values.yaml.
+     En dev : tls.enabled: false → HTTP seulement, pas besoin de certificat.
+     En prod : tls.enabled: true + secretName → HTTPS avec cert-manager.
+
+  3. Accès à un sous-objet : .Values.ingress.tls.secretName
+     → les objets dans values.yaml sont parcourus avec des "."
+     Chaque "." descend d'un niveau dans la hiérarchie YAML.
+
+Annotations NGINX :
+  Les annotations passent des instructions spécifiques à l'Ingress Controller.
+  Elles varient selon le contrôleur (NGINX, Traefik, HAProxy...).
+  nginx.ingress.kubernetes.io/* → spécifiques à NGINX Ingress Controller.
+=============================================================================
+*/}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "odoo.fullname" . }}-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+  annotations:
+    # Supprime la limite de taille des requêtes — nécessaire pour les uploads Odoo
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # Timeout pour les opérations longues d'Odoo (génération de rapports, imports)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  # ingressClassName : quel Ingress Controller doit traiter cette règle
+  # Valeur depuis values.yaml → peut être "nginx", "traefik", "haproxy", etc.
+  ingressClassName: {{ .Values.ingress.className }}
+
+  rules:
+    # .Values.ingress.host : surcharger selon l'environnement
+    #   Dev    : odoo.lab.local
+    #   Prod   : odoo.monentreprise.com
+    #   KillerCoda : l'URL fournie par la plateforme
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            # Prefix "/" : toutes les URLs commençant par "/" sont routées vers Odoo
+            backend:
+              service:
+                name: {{ include "odoo.fullname" . }}-svc
+                port:
+                  # .Values.service.port assure la cohérence avec service.yaml
+                  number: {{ .Values.service.port }}
+
+  # Bloc TLS optionnel — activer avec ingress.tls.enabled: true
+  # Nécessite cert-manager installé sur le cluster pour les certificats Let's Encrypt
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      # Le Secret TLS créé par cert-manager contient le certificat et la clé privée
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+{{- end }}

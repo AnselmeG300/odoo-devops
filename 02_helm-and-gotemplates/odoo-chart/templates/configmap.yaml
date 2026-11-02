@@ -1,0 +1,55 @@
+{{/*
+=============================================================================
+CONFIGMAP — Configuration non sensible d'Odoo et PostgreSQL
+=============================================================================
+
+Un ConfigMap stocke des données de configuration en clair (non chiffrées).
+Règle : données NON SENSIBLES ici, données sensibles dans le Secret.
+
+Contenu de ce ConfigMap :
+  - Coordonnées de connexion PostgreSQL (host, port, user, db name)
+  - Ces valeurs sont lues par le Deployment Odoo via des variables d'environnement
+
+Flux de données :
+  values.yaml → ConfigMap → variables d'environnement → conteneur Odoo
+
+Fonctions Go template utilisées ici :
+  include "odoo.fullname" .  → nom de la release (ex: "odoo")
+  .Release.Namespace         → namespace cible
+  include "odoo.labels" .    → labels standards (app.kubernetes.io/*)
+  | nindent 4                → indente le résultat de include de 4 espaces
+  | quote                    → entoure la valeur de guillemets (évite les erreurs YAML)
+
+Pourquoi | quote ?
+  Sans quote : PORT: 5432 → YAML interprète comme entier → problèmes potentiels
+  Avec quote : PORT: "5432" → string garantie → Kubernetes traite correctement
+=============================================================================
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Nom unique dans le namespace : <release-name>-config
+  # Si la release s'appelle "odoo-prod" → "odoo-prod-config"
+  name: {{ include "odoo.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+data:
+  # Nom de la base de données PostgreSQL
+  # Odoo l'utilise à l'initialisation pour créer/se connecter à la BDD
+  POSTGRES_DB: {{ .Values.postgresql.database | quote }}
+
+  # Adresse du Service PostgreSQL — résolue par le DNS Kubernetes
+  # Format : <nom-service>.<namespace>.svc.cluster.local
+  # (on peut utiliser juste le nom si dans le même namespace)
+  POSTGRES_HOST: {{ include "odoo.fullname" . }}-postgresql-svc
+  HOST: {{ include "odoo.fullname" . }}-postgresql-svc
+
+  # Port PostgreSQL standard
+  POSTGRES_PORT: "5432"
+  PORT: "5432"
+
+  # Utilisateur PostgreSQL pour Odoo
+  # Le mot de passe correspondant est dans le Secret (pas ici)
+  USER: {{ .Values.postgresql.user | quote }}
+  DB: {{ .Values.postgresql.database | quote }}

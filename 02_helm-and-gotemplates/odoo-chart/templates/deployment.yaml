@@ -1,0 +1,194 @@
+{{/*
+=============================================================================
+DEPLOYMENT — Odoo avec init container et sidecar Fluent Bit
+=============================================================================
+
+Odoo — présentation technique (voir aussi Sprint 1 : 06-odoo-deployment.yaml)
+──────────────────────────────────────────────────────────────────────────────
+Odoo est un ERP open-source multi-tiers :
+  - Serveur Python (Werkzeug) qui expose HTTP sur le port 8069
+  - ORM propriétaire qui génère du SQL pour PostgreSQL
+  - Interface web en JavaScript (framework OWL)
+  - Nécessite PostgreSQL — ne démarre pas sans une BDD accessible
+
+Valeurs sensibles dans ce Deployment :
+  - POSTGRES_PASSWORD : mot de passe BDD — vient du Secret (jamais en clair ici)
+  - HOST, PORT, USER  : configuration de connexion — vient du ConfigMap
+
+Structure de ce pod (3 conteneurs) :
+  1. wait-for-postgresql  → INIT CONTAINER (s'exécute avant, puis s'arrête)
+  2. odoo                 → conteneur principal
+  3. log-exporter         → SIDECAR Fluent Bit (optionnel via logExporter.enabled)
+
+Ce que ce template ajoute par rapport au Sprint 1 :
+  ✓ Paramétrage des ressources via .Values.resources (toYaml)
+  ✓ Paramétrage de l'image via .Values.image.*
+  ✓ Sidecar rendu conditionnel ({{- if .Values.logExporter.enabled }})
+  ✓ Nommage cohérent via include "odoo.fullname"
+=============================================================================
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "odoo.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: odoo
+spec:
+  # .Values.replicaCount permet de scaler facilement en prod :
+  #   helm upgrade odoo ./odoo-chart --set replicaCount=3
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "odoo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: odoo
+  template:
+    metadata:
+      labels:
+        {{- include "odoo.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: odoo
+    spec:
+
+      # ─── INIT CONTAINER : attente de PostgreSQL ───────────────────────────────
+      # Un init container s'exécute AVANT les conteneurs principaux.
+      # Il doit se terminer avec exit 0 pour que le pod continue son démarrage.
+      # Kubernetes le relance automatiquement en cas d'échec.
+      initContainers:
+        - name: wait-for-postgresql
+          image: busybox:1.35
+          # busybox : image minimaliste (~1 Mo) avec utilitaires Unix de base
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z {{ include "odoo.fullname" . }}-postgresql-svc 5432; do
+                echo "Attente de PostgreSQL..."
+                sleep 2
+              done
+              echo "PostgreSQL prêt. Démarrage d'Odoo."
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+
+      # ─── CONTENEURS PRINCIPAUX ────────────────────────────────────────────────
+      containers:
+
+        # ── Conteneur 1 : Odoo ─────────────────────────────────────────────────
+        - name: odoo
+          # Syntaxe : "repo:tag" avec guillemets pour éviter que YAML interprète
+          # le ":" dans le tag comme un séparateur de clé/valeur
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8069
+              name: http           # Port HTTP Odoo
+            - containerPort: 8072
+              name: longpolling    # Notifications temps réel
+
+          env:
+            # Chaque variable d'environnement est injectée depuis une ressource K8s
+            # → Odoo lit ces variables au démarrage pour se connecter à la BDD
+            - name: HOST           # Nom DNS du Service PostgreSQL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "odoo.fullname" . }}-config
+                  key: HOST
+
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "odoo.fullname" . }}-config
+                  key: PORT
+
+            - name: USER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "odoo.fullname" . }}-config
+                  key: USER
+
+            - name: PASSWORD       # Mot de passe — vient du Secret (valeur chiffrée)
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "odoo.fullname" . }}-secret
+                  key: POSTGRES_PASSWORD
+
+          # Probes : Kubernetes surveille le conteneur en continu
+          # /web/health → endpoint natif Odoo, retourne HTTP 200 quand prêt
+          livenessProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            initialDelaySeconds: 60   # Odoo met ~60s à charger ses modules
+            periodSeconds: 15
+            failureThreshold: 5       # 5 échecs → conteneur redémarré
+
+          readinessProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            # Différence liveness/readiness :
+            # readiness = "pas encore prêt" → trafic redirigé, pas de redémarrage
+            # liveness  = "conteneur mort"  → redémarrage déclenché
+
+          resources:
+            # toYaml convertit la map .Values.resources en YAML indenté
+            # Permet de définir requests/limits dans values.yaml de manière lisible
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: odoo-data
+              mountPath: /var/lib/odoo
+              # Stockage des uploads et sessions Odoo
+              # emptyDir pour ce sprint — utiliser un PVC en production
+
+            - name: odoo-logs
+              mountPath: /var/log/odoo
+              # Volume partagé avec le sidecar Fluent Bit
+
+        # ── Conteneur 2 : Fluent Bit (sidecar conditionnel) ────────────────────
+        {{- if .Values.logExporter.enabled }}
+        # {{- if ... }} : bloc conditionnel Go template
+        # Si false dans values.yaml → ce conteneur entier est absent du YAML rendu
+        # Si true  → le conteneur est injecté dans la liste "containers:"
+        - name: log-exporter
+          image: "{{ .Values.logExporter.image.repository }}:{{ .Values.logExporter.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-c"
+            - "/fluent-bit/etc/fluent-bit.conf"
+
+          volumeMounts:
+            - name: odoo-logs
+              mountPath: /var/log/app
+              # Lit les fichiers de logs Odoo depuis le volume partagé
+
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc
+              # Configuration Fluent Bit depuis le ConfigMap
+
+          resources:
+            {{- toYaml .Values.logExporter.resources | nindent 12 }}
+        {{- end }}
+
+      # ─── VOLUMES du pod ───────────────────────────────────────────────────────
+      volumes:
+        - name: odoo-data
+          emptyDir: {}
+          # Ephémère pour ce sprint — remplacer par un PVC en production
+
+        - name: odoo-logs
+          emptyDir: {}
+          # Canal de communication par fichiers entre "odoo" et "log-exporter"
+
+        {{- if .Values.logExporter.enabled }}
+        - name: fluent-bit-config
+          configMap:
+            name: {{ include "odoo.fullname" . }}-fluent-bit-config
+        {{- end }}

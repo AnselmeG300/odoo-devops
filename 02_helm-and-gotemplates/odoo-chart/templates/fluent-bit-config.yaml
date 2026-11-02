@@ -1,0 +1,82 @@
+{{/*
+=============================================================================
+CONFIGMAP — Configuration Fluent Bit (partagée entre les deux pods)
+=============================================================================
+
+Ce ConfigMap est monté en tant que volume dans les sidecars "log-exporter"
+du Deployment Odoo et du StatefulSet PostgreSQL.
+
+Différence avec Sprint 1 :
+  Sprint 1 : ConfigMap nommé "fluent-bit-config" (nom fixe, namespace "odoo")
+  Sprint 2 : Nom généré via include "odoo.fullname" → "odoo-fluent-bit-config"
+             Rendu conditionnel via {{- if .Values.logExporter.enabled }}
+
+Pourquoi conditionnel ?
+  En environnement de test, on peut désactiver le sidecar pour économiser
+  des ressources ou simplifier le debugging.
+  logExporter.enabled: false → ce ConfigMap n'est pas créé → les sidecars non plus.
+=============================================================================
+*/}}
+{{- if .Values.logExporter.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "odoo.fullname" . }}-fluent-bit-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+data:
+  # ─── Configuration principale de Fluent Bit ─────────────────────────────────
+  # La valeur "|-" en YAML définit un bloc de texte littéral (literal block scalar)
+  # sans retour à la ligne final. Le contenu est traité comme une string brute.
+  fluent-bit.conf: |
+    # [SERVICE] : paramètres globaux du daemon Fluent Bit
+    [SERVICE]
+        Flush         5          # Envoie les logs en buffer toutes les 5 secondes
+        Daemon        Off        # Mode conteneur : ne pas forker en background
+        Log_Level     info       # Niveau de verbosité du daemon lui-même
+        Parsers_File  parsers.conf
+
+    # [INPUT] : source des logs — fichiers écrits par le conteneur principal
+    # path /var/log/app/*.log correspond au montVolume du sidecar
+    [INPUT]
+        Name              tail
+        Path              /var/log/app/*.log
+        Tag               app.logs
+        Refresh_Interval  5      # Détecte les nouveaux fichiers toutes les 5s
+        Read_from_Head    True   # Lit depuis le début du fichier (important au restart)
+
+    # [FILTER] : enrichit chaque log avec les métadonnées Kubernetes du pod
+    # (namespace, nom du pod, nom du conteneur, labels)
+    [FILTER]
+        Name                kubernetes
+        Match               app.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Merge_Log           On   # Fusionne les champs JSON dans le log principal
+        Keep_Log            Off
+
+    # [OUTPUT] : destination des logs collectés
+    # stdout → les logs apparaissent dans : kubectl logs <pod> -c log-exporter
+    # En production, remplacer par une sortie vers Loki, Elasticsearch, CloudWatch...
+    [OUTPUT]
+        Name   stdout
+        Match  *
+        Format json_lines   # Format JSON structuré, un log par ligne
+
+  # ─── Parsers personnalisés ───────────────────────────────────────────────────
+  parsers.conf: |
+    # Parser PostgreSQL : extrait timestamp, PID, level et message
+    [PARSER]
+        Name        postgresql
+        Format      regex
+        Regex       ^(?<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3} \w+) \[(?<pid>\d+)\] (?<level>\w+):\s+(?<message>.+)$
+        Time_Key    time
+        Time_Format %Y-%m-%d %H:%M:%S.%L %Z
+
+    # Parser JSON : pour les applications qui écrivent des logs JSON structurés
+    [PARSER]
+        Name        json
+        Format      json
+        Time_Key    timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S.%L
+{{- end }}

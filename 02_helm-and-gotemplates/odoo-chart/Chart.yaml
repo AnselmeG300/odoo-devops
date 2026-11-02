@@ -1,0 +1,17 @@
+apiVersion: v2
+name: odoo-chart
+description: Chart Helm pour déployer Odoo et PostgreSQL sur Kubernetes
+type: application
+version: 0.1.0          # Version du chart (incrémentée à chaque changement du chart)
+appVersion: "16.0"      # Version de l'application Odoo déployée
+
+maintainers:
+  - name: SRE Team
+    email: sre@example.com
+
+keywords:
+  - odoo
+  - erp
+  - postgresql
+
+https://www.youtube.com/watch?v=eIpDDRETuUQ

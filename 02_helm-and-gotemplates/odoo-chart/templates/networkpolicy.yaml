@@ -1,0 +1,111 @@
+{{/*
+=============================================================================
+NETWORKPOLICIES — Contrôle du trafic réseau (optionnel)
+=============================================================================
+
+Par défaut Kubernetes : TOUT le trafic inter-pods est autorisé.
+Une NetworkPolicy applique le principe "deny by default" :
+  dès qu'un pod est sélectionné par une policy, tout trafic non listé est bloqué.
+
+Ce template crée DEUX policies quand networkPolicy.enabled: true :
+  1. <release>-postgresql-netpol : PostgreSQL n'accepte que le trafic d'Odoo
+  2. <release>-odoo-netpol        : Odoo accepte le trafic HTTP de l'Ingress
+                                    et peut sortir vers PostgreSQL + DNS
+
+Concept Go template clé — nindent dans un bloc conditionnel :
+  {{- include "odoo.selectorLabels" . | nindent 14 }}
+  Le tiret dans {{- supprime les espaces/sauts AVANT le tag.
+  nindent 14 ajoute 14 espaces d'indentation AVANT chaque ligne du résultat.
+  Cela permet d'inclure un bloc multi-lignes dans un contexte indenté.
+
+Pourquoi rendre les NetworkPolicies optionnelles ?
+  En développement local (minikube, kind), le CNI peut ne pas supporter
+  les NetworkPolicies (ex: Flannel sans NetworkPolicy support).
+  networkPolicy.enabled: false permet de déployer sans erreur dans ce cas.
+  En production : toujours activer les NetworkPolicies.
+=============================================================================
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+---
+# ─── POLICY 1 : PostgreSQL — seul Odoo peut se connecter ────────────────────
+# Cette policy s'applique aux pods PostgreSQL de cette release uniquement
+# (grâce aux selectorLabels qui incluent le nom de la release)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "odoo.fullname" . }}-postgresql-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      # Sélectionne uniquement les pods PostgreSQL de CETTE release
+      # Si deux releases coexistent dans le namespace, chacune a ses propres policies
+      {{- include "odoo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  policyTypes:
+    - Ingress   # Contrôle le trafic ENTRANT vers PostgreSQL
+  ingress:
+    # Autorise les connexions TCP/5432 depuis les pods Odoo de CETTE release uniquement
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "odoo.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: odoo
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ─── POLICY 2 : Odoo — accès restreint en entrée et en sortie ───────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "odoo.fullname" . }}-odoo-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "odoo.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: odoo
+  policyTypes:
+    - Ingress   # Contrôle le trafic ENTRANT vers Odoo
+    - Egress    # Contrôle le trafic SORTANT depuis Odoo
+
+  ingress:
+    # Seul l'Ingress Controller peut envoyer du trafic HTTP vers Odoo
+    # .Values.networkPolicy.ingressControllerNamespace : modifiable si le namespace nginx est différent
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace }}
+      ports:
+        - protocol: TCP
+          port: 8069
+
+  egress:
+    # Règle 1 : DNS — obligatoire pour résoudre "postgresql-svc" en IP
+    # CoreDNS tourne dans kube-system sur les ports 53 UDP et TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Règle 2 : PostgreSQL — Odoo peut se connecter à sa propre BDD
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "odoo.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}

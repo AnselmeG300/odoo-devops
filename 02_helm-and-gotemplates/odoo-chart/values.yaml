@@ -1,0 +1,114 @@
+# =============================================================================
+# VALUES PAR DÉFAUT — Odoo Chart
+# =============================================================================
+#
+# Ce fichier définit les valeurs par défaut du chart.
+# Toutes les valeurs peuvent être surchargées :
+#   - Via un fichier : helm install odoo ./odoo-chart -f values-prod.yaml
+#   - Via --set      : helm install odoo ./odoo-chart --set replicaCount=3
+#   - Les deux       : helm install odoo ./odoo-chart -f values-prod.yaml --set image.tag=16.1
+#
+# Priorité (du plus faible au plus fort) :
+#   values.yaml < -f fichier < --set
+# =============================================================================
+
+# ─── APPLICATION ODOO ────────────────────────────────────────────────────────
+
+# Nombre de réplicas Odoo (scale horizontal)
+# Attention : Odoo n'est pas totalement stateless, prévoir un PVC partagé si > 1
+replicaCount: 1
+
+# Image Docker Odoo
+image:
+  repository: odoo
+  tag: "16.0"
+  pullPolicy: IfNotPresent
+  # IfNotPresent : utilise le cache local si l'image est déjà présente sur le nœud
+  # Always       : force le pull à chaque démarrage de pod (recommandé en CI)
+
+# ─── BASE DE DONNÉES POSTGRESQL ───────────────────────────────────────────────
+
+postgresql:
+  image:
+    repository: postgres
+    tag: "14"
+  database: odoo_db    # Nom de la base de données créée au 1er démarrage
+  user: odoo_user      # Utilisateur PostgreSQL pour Odoo
+  password: odoo_password    # À surcharger obligatoirement en production !
+                              # Ne jamais committer un vrai mot de passe ici.
+                              # Utiliser : --set postgresql.password=$SECRET
+                              #         ou un outil comme Vault / Sealed Secrets
+  storage: 2Gi         # Taille du PVC PostgreSQL
+
+# ─── SERVICE ODOO ─────────────────────────────────────────────────────────────
+
+service:
+  type: ClusterIP    # Accessible uniquement en interne (via Ingress pour l'externe)
+                     # Changer en NodePort si pas d'Ingress Controller
+  port: 8069         # Port HTTP d'Odoo
+
+# ─── INGRESS ──────────────────────────────────────────────────────────────────
+
+ingress:
+  enabled: true      # false = pas d'exposition HTTP externe (utile en dev/test)
+  className: nginx   # Nom de l'Ingress Controller à utiliser
+  host: odoo.lab.local   # À surcharger selon l'environnement :
+                          # KillerCoda : l'URL fournie par la plateforme
+                          # Production : odoo.monentreprise.com
+  tls:
+    enabled: false        # false = HTTP | true = HTTPS (nécessite cert-manager)
+    secretName: odoo-tls  # Nom du Secret TLS créé par cert-manager
+
+# ─── RESSOURCES ODOO ──────────────────────────────────────────────────────────
+
+# requests : ressources GARANTIES par le scheduler
+# limits   : maximum absolu (CPU throttlé, RAM → OOMKilled si dépassé)
+resources:
+  requests:
+    cpu: 250m       # 0.25 vCPU garanti
+    memory: 512Mi   # 512 Mo RAM garanti
+  limits:
+    cpu: 1000m      # 1 vCPU max
+    memory: 1Gi
+
+# ─── RESSOURCES POSTGRESQL ────────────────────────────────────────────────────
+
+postgresqlResources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# ─── SIDECAR LOG EXPORTER (Fluent Bit) ────────────────────────────────────────
+
+logExporter:
+  enabled: true    # false = désactive le sidecar et le ConfigMap Fluent Bit
+                   # Utile en dev pour économiser des ressources ou simplifier le debug
+  image:
+    repository: fluent/fluent-bit
+    tag: "2.1.10"  # Fixer la version pour la reproductibilité
+  resources:
+    requests:
+      cpu: 50m        # Fluent Bit est très léger
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# ─── SÉCURITÉ RÉSEAU ─────────────────────────────────────────────────────────
+
+networkPolicy:
+  enabled: true    # false = pas de NetworkPolicy (à désactiver si le CNI ne les supporte pas)
+  ingressControllerNamespace: ingress-nginx
+  # Namespace où tourne l'Ingress Controller NGINX.
+  # Vérifier avec : kubectl get pods -A | grep ingress
+
+# ─── RESSOURCES QUOTA ─────────────────────────────────────────────────────────
+
+resourceQuota:
+  enabled: true
+  maxPods: "10"
+  maxCpu: "4"
+  maxMemory: 4Gi

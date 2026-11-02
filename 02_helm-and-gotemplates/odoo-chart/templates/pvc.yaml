@@ -1,0 +1,59 @@
+{{/*
+=============================================================================
+PERSISTENTVOLUMECLAIM — Réservation de stockage persistant pour PostgreSQL
+=============================================================================
+
+Un PVC (PersistentVolumeClaim) est une DEMANDE de stockage faite par l'application.
+Kubernetes trouve un PV (PersistentVolume) compatible et les lie ensemble (Bound).
+
+Différence Sprint 1 vs Sprint 2 :
+  Sprint 1 :
+    - PV créé manuellement (03a-pv.yaml) avec storageClassName: manual
+    - PVC qui référence ce storageClassName pour le trouver
+  Sprint 2 :
+    - PAS de PV manuel — on laisse le cluster provisionner dynamiquement
+    - Pas de storageClassName déclaré → le cluster utilise la StorageClass par défaut
+    - Sur KillerCoda : StorageClass "standard" (provisionning automatique)
+    - Sur AWS EKS    : StorageClass "gp2" ou "gp3" (EBS SSD)
+    - Sur GKE        : StorageClass "standard" (persistent-disk)
+
+Provisionning dynamique :
+  PVC créé → la StorageClass détecte la demande → crée automatiquement le PV
+  correspondant sur le backend de stockage → les deux sont bindés ensemble.
+
+  ┌──────────────┐
+  │ StorageClass │ (standard, gp3...)
+  └──────┬───────┘
+         │ crée automatiquement
+         ▼
+  ┌────────┐       ┌────────┐
+  │   PV   │ ←──── │  PVC   │ ←── StatefulSet
+  └────────┘  bind └────────┘
+
+La taille du volume est paramétrable via .Values.postgresql.storage.
+Pour redimensionner en production : modifier la valeur et helm upgrade
+(requiert que la StorageClass supporte l'expansion de volume).
+=============================================================================
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  # Nom référencé dans le volumeClaimTemplate du StatefulSet
+  name: {{ include "odoo.fullname" . }}-postgresql-pvc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "odoo.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce   # Monté en lecture/écriture par UN SEUL nœud à la fois
+                      # Adapté à PostgreSQL standalone (pas de partage multi-nœuds)
+
+  resources:
+    requests:
+      # .Values.postgresql.storage : "2Gi" par défaut, surcharger en production
+      # La valeur doit inclure l'unité : "10Gi", "100Gi", etc.
+      storage: {{ .Values.postgresql.storage }}
+
+  # storageClassName absent → utilise la StorageClass par défaut du cluster
+  # Pour spécifier explicitement : storageClassName: gp3
+  # Pour désactiver le provisionning dynamique (comme Sprint 1) : storageClassName: manual
