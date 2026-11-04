@@ -1,0 +1,140 @@
+#@ load("@ytt:data", "data")
+#@ load("helpers.lib.yaml", "common_labels", "selector_labels")
+
+#@ pg = data.values.postgresql
+
+#! =============================================================================
+#! BASE DE DONNEES - StatefulSet PostgreSQL + sidecar Fluent Bit + Service
+#! =============================================================================
+#! StatefulSet : identite stable (postgresql-0), ordre de demarrage, DNS stable.
+#! Deux conteneurs : postgresql (principal) et log-exporter (sidecar Fluent Bit)
+#! qui partagent le volume emptyDir pg-logs.
+#! =============================================================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("postgresql", "database")
+spec:
+  serviceName: postgresql-svc
+  replicas: 1
+  selector:
+    matchLabels: #@ selector_labels("postgresql")
+  template:
+    metadata:
+      labels: #@ common_labels("postgresql", "database")
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgresql
+          image: #@ pg.image + ":" + pg.tag
+          ports:
+            - containerPort: 5432
+              name: postgresql
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: odoo-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          args:
+            - "-c"
+            - "logging_collector=on"
+            - "-c"
+            - "log_directory=/var/log/postgresql"
+            - "-c"
+            - "log_filename=postgresql.log"
+            - "-c"
+            - "log_statement=none"
+            - "-c"
+            - "log_connections=on"
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: pg-logs
+              mountPath: /var/log/postgresql
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - #@ pg.user
+                - -d
+                - #@ pg.database
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - #@ pg.user
+                - -d
+                - #@ pg.database
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+        - name: log-exporter
+          image: #@ data.values.fluentbit.image + ":" + data.values.fluentbit.tag
+          args:
+            - "-c"
+            - "/fluent-bit/etc/fluent-bit.conf"
+          volumeMounts:
+            - name: pg-logs
+              mountPath: /var/log/app
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: postgresql-data
+          persistentVolumeClaim:
+            claimName: postgresql-pvc
+        - name: pg-logs
+          emptyDir: {}
+        - name: fluent-bit-config
+          configMap:
+            name: fluent-bit-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-svc
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("postgresql", "database")
+spec:
+  type: ClusterIP
+  selector: #@ selector_labels("postgresql")
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

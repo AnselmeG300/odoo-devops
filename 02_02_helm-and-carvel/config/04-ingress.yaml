@@ -1,0 +1,53 @@
+#@ load("@ytt:data", "data")
+#@ load("helpers.lib.yaml", "common_labels")
+
+#@ odoo = data.values.odoo
+
+#! =============================================================================
+#! INGRESS - Exposition HTTP de l'application
+#! =============================================================================
+#! Le host vient de data.values.odoo.host (odoo.lab.local en lab, le vrai domaine
+#! en prod). La className vient de data.values.ingress.className.
+#!
+#! La regle SANS host (necessaire derriere le proxy KillerCoda qui ne transmet
+#! pas le header Host) n'est generee QUE hors production, via un conditionnel ytt
+#! "#@ if". En prod, seule la regle par host subsiste. C'est l'equivalent du
+#! "{{ if }}" de GoTemplate, mais verifie a la compilation.
+#! =============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: odoo-ingress
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("odoo", "application")
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: #@ data.values.ingress.className
+  rules:
+    #! Regle 1 : routage par Host (conservee dans tous les environnements)
+    - host: #@ odoo.host
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: odoo-svc
+                port:
+                  number: 8069
+    #@ if data.values.environment != "prod":
+    #! Regle 2 : sans host, pour l'acces via le proxy KillerCoda. Retiree en prod.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: odoo-svc
+                port:
+                  number: 8069
+    #@ end

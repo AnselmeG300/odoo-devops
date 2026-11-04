@@ -1,0 +1,193 @@
+#@ load("@ytt:data", "data")
+#@ load("helpers.lib.yaml", "common_labels", "selector_labels")
+
+#@ odoo = data.values.odoo
+#@ db = data.values.postgresql.database
+#@ odoo_image = odoo.image + ":" + odoo.tag
+
+#! =============================================================================
+#! APPLICATION - Deployment Odoo + Service
+#! =============================================================================
+#! Deux initContainers :
+#!   1. wait-for-postgresql : attend que la BDD reponde en TCP
+#!   2. odoo-db-init        : initialise le schema (-d <db> -i base) puis s'arrete
+#! Conteneur principal odoo + sidecar log-exporter.
+#!
+#! odoo-db-init et le conteneur principal partagent la MEME image (odoo_image) :
+#! une seule data value, impossible de les desynchroniser (piege classique init
+#! en 16 / service en 19). C'est un apport direct du templating sur des manifests
+#! separes.
+#! =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: odoo
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("odoo", "application")
+spec:
+  replicas: #@ odoo.replicas
+  selector:
+    matchLabels: #@ selector_labels("odoo")
+  template:
+    metadata:
+      labels: #@ common_labels("odoo", "application")
+    spec:
+      initContainers:
+        - name: wait-for-postgresql
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgresql-svc 5432; do
+                echo "PostgreSQL pas encore pret, nouvelle tentative dans 2s..."
+                sleep 2
+              done
+              echo "PostgreSQL est pret."
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+        - name: odoo-db-init
+          image: #@ odoo_image
+          args:
+            - -d
+            - #@ db
+            - -i
+            - base
+            - --without-demo=all
+            - --stop-after-init
+          env:
+            - name: HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: HOST
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: PORT
+            - name: USER
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: USER
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: odoo-secret
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      containers:
+        - name: odoo
+          image: #@ odoo_image
+          args:
+            - -d
+            - #@ db
+          ports:
+            - containerPort: 8069
+              name: http
+            - containerPort: 8072
+              name: longpolling
+          env:
+            - name: HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: HOST
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: PORT
+            - name: USER
+              valueFrom:
+                configMapKeyRef:
+                  name: odoo-config
+                  key: USER
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: odoo-secret
+                  key: POSTGRES_PASSWORD
+          startupProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            periodSeconds: 10
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            periodSeconds: 15
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /web/health
+              port: 8069
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: odoo-data
+              mountPath: /var/lib/odoo
+            - name: odoo-logs
+              mountPath: /var/log/odoo
+        - name: log-exporter
+          image: #@ data.values.fluentbit.image + ":" + data.values.fluentbit.tag
+          args:
+            - "-c"
+            - "/fluent-bit/etc/fluent-bit.conf"
+          volumeMounts:
+            - name: odoo-logs
+              mountPath: /var/log/app
+            - name: fluent-bit-config
+              mountPath: /fluent-bit/etc
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: odoo-data
+          emptyDir: {}
+        - name: odoo-logs
+          emptyDir: {}
+        - name: fluent-bit-config
+          configMap:
+            name: fluent-bit-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: odoo-svc
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("odoo", "application")
+spec:
+  type: ClusterIP
+  selector: #@ selector_labels("odoo")
+  ports:
+    - name: http
+      port: 8069
+      targetPort: 8069
+      protocol: TCP

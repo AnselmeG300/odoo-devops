@@ -1,0 +1,27 @@
+#@ load("@ytt:data", "data")
+
+#@ # -----------------------------------------------------------------------------
+#@ # FONCTIONS YTT PARTAGEES (equivalent du _helpers.tpl de Helm)
+#@ # -----------------------------------------------------------------------------
+#@ # Centralise les fragments repetes dans tous les templates.
+#@ # Un seul endroit a corriger si la convention de labels change.
+#@ # -----------------------------------------------------------------------------
+
+#@ # Labels complets, poses sur metadata.labels de chaque objet.
+#@ # Incluent l'environnement : utile pour filtrer (kubectl get ... -l environment=prod).
+#@ def common_labels(name, component):
+app.kubernetes.io/name: #@ name
+app.kubernetes.io/instance: #@ name
+app.kubernetes.io/component: #@ component
+app.kubernetes.io/part-of: odoo-stack
+app.kubernetes.io/managed-by: carvel
+environment: #@ data.values.environment
+#@ end
+
+#@ # Labels minimaux et STABLES, poses sur les selectors et les labels de pod.
+#@ # On n'y met pas environment : les selectors de Deployment/StatefulSet sont
+#@ # immuables apres creation, ils ne doivent donc jamais dependre d'une valeur
+#@ # qui change d'un environnement a l'autre.
+#@ def selector_labels(name):
+app.kubernetes.io/name: #@ name
+#@ end

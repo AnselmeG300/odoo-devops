@@ -1,0 +1,51 @@
+#@data/values-schema
+---
+#! =============================================================================
+#! SCHEMA DES DATA VALUES - ytt
+#! =============================================================================
+#! Ce fichier declare, type et documente toutes les valeurs configurables du
+#! deploiement. Les valeurs ci-dessous sont les DEFAUTS (profil lab).
+#! Un fichier #@data/values (voir values/values-prod.yaml) peut les surcharger.
+#!
+#! ytt verifie les types : une surcharge qui change le type d'une cle, ou qui
+#! ajoute une cle absente du schema, provoque une erreur. C'est la difference
+#! avec le values.yaml de Helm, ou une faute de frappe passe silencieusement.
+#! =============================================================================
+
+#! Namespace cible de toute la stack
+namespace: odoo
+
+#! environnement logique : lab | dev | prod (sert de label et de reperage)
+environment: lab
+
+#! Application Odoo
+odoo:
+  image: odoo
+  tag: "19.0"
+  replicas: 1
+  #! host HTTP expose par l'Ingress (surcharge par environnement)
+  host: odoo.lab.local
+
+#! Base de donnees PostgreSQL
+postgresql:
+  image: postgres
+  tag: "15"
+  database: odoo_db
+  user: odoo_user
+  #! taille du volume persistant demande par le PVC
+  storage: 2Gi
+
+#! Sidecar collecteur de logs
+fluentbit:
+  image: fluent/fluent-bit
+  tag: "2.1.10"
+
+#! Ingress
+ingress:
+  className: nginx
+
+#! Secrets en clair ici pour le lab. En production : ne jamais committer,
+#! ces valeurs seront chiffrees avec SOPS et AGE au Sprint 6.
+secrets:
+  postgresPassword: odoo_password
+  odooAdminPassword: odoo_admin_pass

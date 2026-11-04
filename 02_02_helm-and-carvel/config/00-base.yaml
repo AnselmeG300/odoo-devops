@@ -1,0 +1,90 @@
+#@ load("@ytt:data", "data")
+#@ load("@ytt:base64", "base64")
+#@ load("helpers.lib.yaml", "common_labels")
+
+#! =============================================================================
+#! NAMESPACE + CONFIGMAP + SECRET + CONFIG FLUENT BIT
+#! =============================================================================
+#! Memes objets qu'au Sprint 1, mais les valeurs ne sont plus codees en dur :
+#!   - le nom du namespace vient de data.values.namespace
+#!   - les parametres de connexion viennent du schema
+#!   - le Secret est encode en base64 PAR ytt (base64.encode), on ne colle plus
+#!     des chaines base64 a la main
+#! =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: #@ data.values.namespace
+  labels: #@ common_labels("odoo", "namespace")
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: odoo-config
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("odoo", "config")
+data:
+  POSTGRES_DB: #@ data.values.postgresql.database
+  POSTGRES_HOST: postgresql-svc
+  POSTGRES_PORT: "5432"
+  HOST: postgresql-svc
+  PORT: "5432"
+  USER: #@ data.values.postgresql.user
+  DB: #@ data.values.postgresql.database
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: odoo-secret
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("odoo", "secret")
+type: Opaque
+data:
+  #! base64.encode evite de coller des chaines base64 a la main.
+  #! La valeur en clair reste dans les data values (chiffrees avec SOPS au Sprint 6).
+  POSTGRES_PASSWORD: #@ base64.encode(data.values.secrets.postgresPassword)
+  PGPASSWORD: #@ base64.encode(data.values.secrets.postgresPassword)
+  ODOO_ADMIN_PASSWD: #@ base64.encode(data.values.secrets.odooAdminPassword)
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("fluent-bit", "logging")
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush        5
+        Daemon       Off
+        Log_Level    info
+        Parsers_File parsers.conf
+
+    [INPUT]
+        Name             tail
+        Path             /var/log/app/*.log
+        Tag              app.logs
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [OUTPUT]
+        Name   stdout
+        Match  *
+        Format json_lines
+  parsers.conf: |
+    [PARSER]
+        Name        postgresql
+        Format      regex
+        Regex       ^(?<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3} \w+) \[(?<pid>\d+)\] (?<level>\w+):\s+(?<message>.+)$
+        Time_Key    time
+        Time_Format %Y-%m-%d %H:%M:%S.%L %Z
+
+    [PARSER]
+        Name        json
+        Format      json
+        Time_Key    timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S.%L
