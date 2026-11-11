@@ -1,0 +1,129 @@
+name: CD - Deploiement Odoo sur GKE avec Carvel
+
+# =============================================================================
+# PIPELINE CD (repo de deploiement "odoo-deploy")
+# =============================================================================
+# Role : rendre la config Carvel (Sprint 2) avec l'image fournie, puis la
+# deployer sur le cluster GKE avec kapp.
+#
+# Declencheurs :
+#   - repository_dispatch (type new-image) : automatique, envoye par la CI
+#   - workflow_dispatch                    : manuel, avec choix image/tag/env
+#
+# Note webhook : repository_dispatch est un evenement livre a GitHub par un
+# appel d'API (le job trigger-deploy de la CI). GitHub le recoit comme un
+# webhook entrant et demarre ce workflow. C'est le lien entre les deux repos.
+# =============================================================================
+
+on:
+  repository_dispatch:
+    types: [new-image]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Image complete, sans le tag"
+        required: true
+        default: ghcr.io/anselmeg300/odoo-custom
+      tag:
+        description: "Tag de l'image a deployer"
+        required: true
+      environment:
+        description: "Environnement cible"
+        required: true
+        default: lab
+        type: choice
+        options:
+          - lab
+          - prod
+
+env:
+  KAPP_APP: odoo
+  NAMESPACE: odoo
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1 : rendre les manifests avec ytt (image injectee en data value)
+  # ---------------------------------------------------------------------------
+  render:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.vars.outputs.environment }}
+    steps:
+      - name: Recuperer le code (config Carvel)
+        uses: actions/checkout@v4
+
+      - name: Resoudre les entrees (dispatch automatique ou lancement manuel)
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "image=${{ github.event.client_payload.image }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.event.client_payload.tag }}"     >> "$GITHUB_OUTPUT"
+            echo "environment=lab"                                >> "$GITHUB_OUTPUT"
+          else
+            echo "image=${{ github.event.inputs.image }}"         >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.event.inputs.tag }}"             >> "$GITHUB_OUTPUT"
+            echo "environment=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Installer ytt
+        run: |
+          curl -sL -o /usr/local/bin/ytt \
+            https://github.com/carvel-dev/ytt/releases/latest/download/ytt-linux-amd64
+          chmod +x /usr/local/bin/ytt
+          ytt version
+
+      - name: Rendre les manifests
+        run: |
+          EXTRA=""
+          if [ "${{ steps.vars.outputs.environment }}" = "prod" ]; then
+            EXTRA="-f values/values-prod.yaml -f overlays/prod-resources.yaml"
+          fi
+          ytt -f config/ $EXTRA \
+            --data-value odoo.image=${{ steps.vars.outputs.image }} \
+            --data-value odoo.tag=${{ steps.vars.outputs.tag }} \
+            > rendered.yaml
+          echo "----- Apercu de l'image deployee -----"
+          grep -n "image:" rendered.yaml | grep odoo
+
+      - name: Publier les manifests rendus comme artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-manifests
+          path: rendered.yaml
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 : deployer sur GKE avec kapp
+  #   - needs: render   -> recupere l'artefact rendu
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: render
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer les manifests rendus
+        uses: actions/download-artifact@v4
+        with:
+          name: rendered-manifests
+
+      - name: Installer kapp
+        run: |
+          curl -sL -o /usr/local/bin/kapp \
+            https://github.com/carvel-dev/kapp/releases/latest/download/kapp-linux-amd64
+          chmod +x /usr/local/bin/kapp
+          kapp version
+
+      - name: S'authentifier aupres de Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GKE_SA_KEY }}
+
+      - name: Recuperer les acces au cluster GKE
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Deployer avec kapp
+        run: |
+          kapp deploy -a ${{ env.KAPP_APP }} -n ${{ env.NAMESPACE }} \
+            -f rendered.yaml --yes

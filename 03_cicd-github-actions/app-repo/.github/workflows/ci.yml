@@ -1,0 +1,106 @@
+name: CI - Build et push de l'image Odoo
+
+# =============================================================================
+# PIPELINE CI (repo applicatif "odoo-app")
+# =============================================================================
+# Role : a chaque push, verifier puis construire l'image. Sur main uniquement,
+# pousser l'image dans le registry et declencher le repo de deploiement.
+#
+# Declencheurs :
+#   - push sur main          : build + push + declenchement du deploiement
+#   - push sur feature/**    : build seulement (branche de travail, pas de deploiement)
+#   - workflow_dispatch      : lancement manuel depuis l'onglet Actions
+# =============================================================================
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/odoo-custom
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1 : lint du Dockerfile (garde-fou avant de construire)
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Lint du Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 : build et push de l'image
+  #   - needs: lint       -> ne demarre que si le lint a reussi
+  #   - push conditionnel -> l'image n'est poussee que sur main
+  # ---------------------------------------------------------------------------
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # requis pour pousser dans GHCR avec GITHUB_TOKEN
+    outputs:
+      image_tag: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Calculer le tag (SHA court du commit)
+        id: meta
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Se connecter au registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build et push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # push seulement sur main ; sur une branche de travail, on build sans pousser
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            VCS_REF=${{ steps.meta.outputs.short_sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+  # ---------------------------------------------------------------------------
+  # JOB 3 : declencher le repo de deploiement (repository_dispatch)
+  #   - needs: build                         -> apres un build reussi
+  #   - if: push sur main                    -> jamais depuis une branche de travail
+  #   - envoie l'image et le tag en payload  -> le repo de deploiement sait quoi deployer
+  # ---------------------------------------------------------------------------
+  trigger-deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Envoyer l'evenement au repo de deploiement
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          # jeton PAT avec droit "repo" sur odoo-deploy (secret CD_DISPATCH_TOKEN)
+          token: ${{ secrets.CD_DISPATCH_TOKEN }}
+          repository: ${{ github.repository_owner }}/odoo-deploy
+          event-type: new-image
+          client-payload: |
+            {
+              "image": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}",
+              "tag": "${{ needs.build.outputs.image_tag }}"
+            }

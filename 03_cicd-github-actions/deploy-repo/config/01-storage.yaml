@@ -1,0 +1,44 @@
+#@ load("@ytt:data", "data")
+#@ load("helpers.lib.yaml", "common_labels")
+
+#! =============================================================================
+#! STOCKAGE PERSISTANT - PersistentVolume + PersistentVolumeClaim
+#! =============================================================================
+#! La taille (data.values.postgresql.storage) est partagee entre le PV et le PVC
+#! via la meme data value : impossible de les desynchroniser par erreur, comme
+#! cela pouvait arriver quand les deux manifests etaient edites separement.
+#!
+#! Provisionning STATIQUE (storageClassName: manual) pour rester explicite en lab.
+#! En production GKE : retirer le PV et passer storageClassName a une classe
+#! dynamique (le disque est alors provisionne automatiquement par GCP).
+#! =============================================================================
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgresql-pv
+  labels: #@ common_labels("postgresql", "database")
+spec:
+  capacity:
+    storage: #@ data.values.postgresql.storage
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /mnt/data/postgresql
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgresql-pvc
+  namespace: #@ data.values.namespace
+  labels: #@ common_labels("postgresql", "database")
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: #@ data.values.postgresql.storage
+  storageClassName: manual

@@ -1,0 +1,26 @@
+#@data/values
+---
+#! =============================================================================
+#! SURCHARGE PRODUCTION
+#! =============================================================================
+#! On ne redonne QUE les cles qui changent par rapport au schema (profil lab).
+#! ytt fusionne ce fichier par-dessus les defauts du schema.
+#!
+#! Usage :
+#!   ytt -f config/ -f values/values-prod.yaml
+#! =============================================================================
+
+environment: prod
+
+odoo:
+  replicas: 2
+  host: odoo.monentreprise.com
+
+postgresql:
+  storage: 20Gi
+
+#! En production, ces valeurs ne sont PAS en clair : elles seront fournies
+#! par SOPS/AGE au Sprint 6. Placeholders ici pour montrer la surcharge.
+secrets:
+  postgresPassword: a_remplacer_par_sops
+  odooAdminPassword: a_remplacer_par_sops

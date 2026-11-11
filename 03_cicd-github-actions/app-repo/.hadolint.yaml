@@ -1,0 +1,5 @@
+# Configuration hadolint (lue automatiquement a la racine du depot, CI comprise).
+# DL3066 : "non-numeric user-id". L'utilisateur "odoo" est defini par l'image
+# officielle odoo:19.0 ; l'utiliser par son nom est volontaire et correct ici.
+ignored:
+  - DL3066

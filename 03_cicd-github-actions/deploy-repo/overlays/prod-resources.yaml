@@ -1,0 +1,36 @@
+#@ load("@ytt:overlay", "overlay")
+#@ load("@ytt:data", "data")
+
+#! =============================================================================
+#! OVERLAY - Montee en ressources d'Odoo en production
+#! =============================================================================
+#! Un OVERLAY modifie le YAML DEJA GENERE par matching, sans toucher au template
+#! de base. On s'en sert quand la valeur a changer n'est pas (et n'a pas a etre)
+#! exposee comme data value : ici, les requests/limits du conteneur odoo.
+#!
+#! Difference avec une data value :
+#!   - data value  : un parametre prevu, type, documente dans le schema
+#!   - overlay     : un patch cible sur la sortie, pour les cas non prevus
+#!
+#! Le corps ci-dessous n'est applique QUE si environment == prod, meme si le
+#! fichier est inclus dans la commande. Usage :
+#!   ytt -f config/ -f values/values-prod.yaml -f overlays/prod-resources.yaml
+#! =============================================================================
+
+#@ if data.values.environment == "prod":
+#@overlay/match by=overlay.subset({"kind": "Deployment", "metadata": {"name": "odoo"}})
+---
+spec:
+  template:
+    spec:
+      containers:
+        #@overlay/match by=overlay.map_key("name")
+        - name: odoo
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+#@ end

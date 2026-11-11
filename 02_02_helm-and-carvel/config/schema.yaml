@@ -16,7 +16,7 @@
 namespace: odoo
 
 #! environnement logique : lab | dev | prod (sert de label et de reperage)
-environment: lab
+environment: staging
 
 #! Application Odoo
 odoo:
