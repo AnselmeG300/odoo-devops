@@ -132,6 +132,13 @@ Chaque terme ci-dessous est un objet precis. On les retrouvera dans les workflow
 - Node pool : un groupe de machines (noeuds) du cluster, de meme type. Cree avec le
   cluster, detaille au Sprint 4.
 
+- Ingress Controller (ingress-nginx) : le programme qui APPLIQUE les objets Ingress.
+  Un Ingress seul n'est qu'une regle de routage : sans controleur, il n'a pas
+  d'adresse et rien n'est expose. Le controleur integre a GKE ne traite que la
+  classe "gce" ; notre Ingress utilise ingressClassName: nginx, il faut donc
+  installer ingress-nginx. Son Service de type LoadBalancer fait creer par GCP un
+  load balancer avec une IP publique : c'est la porte d'entree depuis Internet.
+
 - Compte de service (service account) : un compte NON humain, pour qu'un programme
   (ici la pipeline) agisse sur GCP. Il a une adresse en ...iam.gserviceaccount.com.
 
@@ -181,6 +188,13 @@ curl -sL -o /usr/local/bin/kapp https://github.com/carvel-dev/kapp/releases/late
 chmod +x /usr/local/bin/ytt /usr/local/bin/kapp
 ytt version
 kapp version
+```
+
+### helm (pour installer l'Ingress Controller ingress-nginx)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
 ```
 
 ### docker (pour construire l'image en Phase 1)
@@ -281,7 +295,39 @@ gcloud container clusters get-credentials "$CLUSTER" --region="$REGION"
 kubectl get nodes
 ```
 
-## Etape 7 - Deployer avec ytt et kapp (suite directe du Sprint 2)
+## Etape 7 - Installer l'Ingress Controller (ingress-nginx)
+
+Sans cette etape, l'Ingress odoo-ingress reste sans adresse : l'application n'est
+joignable que depuis l'interieur du cluster (les Services sont en ClusterIP).
+
+```bash
+helm upgrade --install ingress-nginx ingress-nginx \
+  --repo https://kubernetes.github.io/ingress-nginx \
+  --version 4.12.1 \
+  --namespace ingress-nginx --create-namespace \
+  --wait --timeout 5m
+
+# Attendre que GCP attribue l'IP publique au load balancer (colonne EXTERNAL-IP)
+kubectl get svc -n ingress-nginx ingress-nginx-controller -w
+```
+
+Points a retenir :
+- `upgrade --install` est idempotent : relancer la commande ne casse rien.
+- `--version` fige la version du chart (reproductible). Lister les versions
+  disponibles : `helm search repo ingress-nginx --versions` (apres
+  `helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx`).
+- `--wait` attend que le controleur soit pret : son webhook d'admission doit
+  repondre AVANT que kapp ne cree l'Ingress, sinon kapp echoue.
+- Le nom du namespace (ingress-nginx) n'est pas libre : la NetworkPolicy
+  odoo-netpol (config/05-governance.yaml) autorise justement ce namespace.
+- Le projet ingress-nginx est en fin de maintenance (annonce de la communaute
+  Kubernetes). Il reste valable pour ce lab ; la cible a terme est la Gateway API
+  (par exemple le GKE Gateway Controller).
+
+Le controleur est une brique d'infrastructure du cluster, installee une fois,
+comme le cluster lui-meme. Il n'appartient pas a l'application kapp "odoo".
+
+## Etape 8 - Deployer avec ytt et kapp (suite directe du Sprint 2)
 
 ```bash
 cd deploy-repo
@@ -300,12 +346,32 @@ kapp deploy -a odoo -n odoo -f rendered.yaml
 cd ..
 ```
 
-## Etape 8 - Verifier le deploiement
+## Etape 9 - Verifier le deploiement et l'acces depuis Internet
 
 ```bash
 kubectl get pods -n odoo -w         # attendre odoo et postgresql en Running 2/2
 kapp inspect -a odoo -n odoo --tree
+
+# L'Ingress doit afficher l'IP publique du load balancer dans ADDRESS
+kubectl get ingress -n odoo
+export LB_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "$LB_IP"
 ```
+
+Acceder a Odoo :
+- En lab (environment: lab), la regle Ingress sans host est generee :
+  `http://$LB_IP/` fonctionne directement depuis un navigateur.
+- Par nom d'hote : odoo.lab.local n'est pas un vrai domaine. Ajouter la ligne
+  `<LB_IP> odoo.lab.local` au fichier hosts du poste (/etc/hosts, ou
+  C:\Windows\System32\drivers\etc\hosts sous Windows).
+- En prod : creer un enregistrement DNS A odoo.monentreprise.com -> LB_IP. La regle
+  sans host n'existe pas en prod, seul le nom de domaine fonctionne.
+
+Attention : l'application est alors publique, en HTTP sans TLS. Le gestionnaire de
+bases d'Odoo (/web/database/manager) est lui aussi joignable : definir un
+admin_passwd fort (ou list_db = False) avant d'exposer durablement. Le TLS
+(cert-manager + Let's Encrypt) viendra dans un sprint ulterieur.
 
 A ce stade, tout a ete fait a la main. On sait exactement ce que la pipeline devra
 faire. On peut automatiser.
@@ -367,7 +433,8 @@ Deux jobs en sequence grace a needs :
   installe ytt, rend la config Carvel en injectant image et tag, et publie rendered.yaml
   comme artefact. En environnement prod, il ajoute values-prod.yaml et l'overlay.
 - deploy : needs render. Telecharge l'artefact, installe kapp, s'authentifie a Google
-  (secret GKE_SA_KEY), recupere les acces GKE, puis kapp deploy.
+  (secret GKE_SA_KEY), recupere les acces GKE, verifie qu'ingress-nginx est present
+  (et l'installe avec helm s'il manque, voir C.5 pour les droits), puis kapp deploy.
 
 ## C.4 - Les secrets a configurer
 
@@ -397,6 +464,15 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:$SA_EMAIL" --role="roles/container.developer"
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:$SA_EMAIL" --role="roles/artifactregistry.reader"
+
+# Note ingress-nginx : son installation cree des objets a l'echelle du cluster
+# (ClusterRole, ClusterRoleBinding, IngressClass, webhook). roles/container.developer
+# ne le permet PAS. La CD se contente donc de verifier que le controleur est present
+# et ne l'installe que s'il manque. Deux options :
+#   - (recommande) installer ingress-nginx une fois a la main (Etape 7) :
+#     container.developer suffit alors a la CD ;
+#   - ou donner roles/container.admin au compte pour que la CD l'installe elle-meme
+#     (plus de droits pour une cle stockee dans GitHub : a eviter hors lab).
 
 # 3. Generer la cle JSON a coller dans le secret GKE_SA_KEY
 gcloud iam service-accounts keys create key.json --iam-account="$SA_EMAIL"
@@ -466,6 +542,20 @@ ghcr.io/OWNER.
 ### get-gke-credentials echoue
 Verifier GKE_CLUSTER et GKE_LOCATION, et que le compte de service a bien
 roles/container.developer. Le plugin gke-gcloud-auth-plugin est installe par l'action.
+
+### L'Ingress n'a pas d'ADDRESS / l'application n'est pas joignable
+ingress-nginx n'est pas installe ou pas pret : `kubectl get pods -n ingress-nginx`
+et `kubectl get ingressclass` (une classe "nginx" doit exister). Refaire l'Etape 7.
+Si EXTERNAL-IP reste en `<pending>`, attendre 1 a 2 minutes (creation du load
+balancer GCP) puis `kubectl describe svc -n ingress-nginx ingress-nginx-controller`.
+
+### failed calling webhook "validate.nginx.ingress.kubernetes.io"
+kapp a cree l'Ingress avant que le controleur soit pret. Relancer le deploiement une
+fois les pods ingress-nginx en Running (c'est le role du --wait de helm).
+
+### La CD echoue sur l'installation d'ingress-nginx (forbidden ... clusterroles)
+Le compte de service n'a que roles/container.developer : installer ingress-nginx une
+fois a la main (Etape 7), ou lui accorder roles/container.admin (voir C.5).
 
 ### kapp: Error: Asking for confirmation
 En CI, kapp doit tourner avec --yes (non interactif). C'est deja le cas dans cd.yml.

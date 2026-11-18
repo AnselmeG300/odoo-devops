@@ -39,6 +39,10 @@ on:
 env:
   KAPP_APP: odoo
   NAMESPACE: odoo
+  # Ingress Controller requis par l'Ingress (ingressClassName: nginx).
+  # Le namespace doit rester "ingress-nginx" : la NetworkPolicy odoo-netpol l'autorise.
+  INGRESS_NGINX_NAMESPACE: ingress-nginx
+  INGRESS_NGINX_CHART_VERSION: "4.12.1"
 
 jobs:
 
@@ -123,7 +127,44 @@ jobs:
           cluster_name: ${{ secrets.GKE_CLUSTER }}
           location: ${{ secrets.GKE_LOCATION }}
 
+      # Sans Ingress Controller, l'Ingress n'a pas d'adresse et Odoo n'est pas
+      # joignable depuis Internet. Installation seulement s'il manque :
+      #   - deja present (installe a la main, Etape 7) -> rien a faire, et
+      #     roles/container.developer suffit au compte de service ;
+      #   - absent -> helm l'installe, ce qui exige roles/container.admin
+      #     (objets cluster-scoped : ClusterRole, IngressClass, webhook).
+      - name: Verifier / installer l'Ingress Controller (ingress-nginx)
+        run: |
+          if kubectl get deployment ingress-nginx-controller \
+               -n "$INGRESS_NGINX_NAMESPACE" >/dev/null 2>&1; then
+            echo "ingress-nginx deja present : installation ignoree."
+          else
+            echo "ingress-nginx absent : installation du chart $INGRESS_NGINX_CHART_VERSION"
+            helm version
+            helm upgrade --install ingress-nginx ingress-nginx \
+              --repo https://kubernetes.github.io/ingress-nginx \
+              --version "$INGRESS_NGINX_CHART_VERSION" \
+              --namespace "$INGRESS_NGINX_NAMESPACE" --create-namespace \
+              --wait --timeout 5m \
+              || { echo "::error::Echec de l'installation d'ingress-nginx. Si l'erreur est 'forbidden', installer le controleur a la main (README Etape 7) ou donner roles/container.admin au compte de service."; exit 1; }
+          fi
+          # Le webhook d'admission doit etre pret avant que kapp cree l'Ingress
+          kubectl rollout status deployment/ingress-nginx-controller \
+            -n "$INGRESS_NGINX_NAMESPACE" --timeout=5m
+
       - name: Deployer avec kapp
         run: |
           kapp deploy -a ${{ env.KAPP_APP }} -n ${{ env.NAMESPACE }} \
             -f rendered.yaml --yes
+
+      - name: Afficher l'adresse publique
+        run: |
+          LB_IP=$(kubectl get svc ingress-nginx-controller -n "$INGRESS_NGINX_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          kubectl get ingress -n ${{ env.NAMESPACE }}
+          if [ -n "$LB_IP" ]; then
+            echo "Odoo est expose via le load balancer : http://$LB_IP/"
+            echo "### Odoo deploye : http://$LB_IP/" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::IP publique pas encore attribuee (EXTERNAL-IP pending)."
+          fi
