@@ -57,8 +57,13 @@ spec:
           args:
             - -d
             - #@ db
+            #! base,web explicitement : "web" porte l'interface (template web.login).
+            #! Il est normalement installe automatiquement avec base (auto_install),
+            #! mais une init interrompue peut le laisser non installe -> page
+            #! "Template not found: 'web.login'". -i est idempotent : sans effet si
+            #! les modules sont deja installes.
             - -i
-            - base
+            - base,web
             - --without-demo=all
             - --stop-after-init
           env:
