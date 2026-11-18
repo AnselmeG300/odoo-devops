@@ -34,6 +34,8 @@ postgresql:
   user: odoo_user
   #! taille du volume persistant demande par le PVC
   storage: 2Gi
+  #! StorageClass du PVC. Sur GKE : standard-rwo (disque persistant GCP, CSI).
+  storageClass: standard-rwo
 
 #! Sidecar collecteur de logs
 fluentbit:

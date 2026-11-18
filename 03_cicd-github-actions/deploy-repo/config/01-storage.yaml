@@ -2,33 +2,18 @@
 #@ load("helpers.lib.yaml", "common_labels")
 
 #! =============================================================================
-#! STOCKAGE PERSISTANT - PersistentVolume + PersistentVolumeClaim
+#! STOCKAGE PERSISTANT - PersistentVolumeClaim (provisionnement DYNAMIQUE)
 #! =============================================================================
-#! La taille (data.values.postgresql.storage) est partagee entre le PV et le PVC
-#! via la meme data value : impossible de les desynchroniser par erreur, comme
-#! cela pouvait arriver quand les deux manifests etaient edites separement.
+#! Sur GKE, on ne declare plus de PersistentVolume hostPath : les noeuds
+#! (Container-Optimized OS) ont un systeme de fichiers racine en LECTURE SEULE,
+#! donc /mnt/data ne peut pas etre cree ("mkdir /mnt/data: read-only file system").
+#! De plus, un hostPath lie les donnees a UN noeud : elles seraient perdues si le
+#! pod etait replanifie ailleurs.
 #!
-#! Provisionning STATIQUE (storageClassName: manual) pour rester explicite en lab.
-#! En production GKE : retirer le PV et passer storageClassName a une classe
-#! dynamique (le disque est alors provisionne automatiquement par GCP).
+#! Le PVC reference une StorageClass dynamique (standard-rwo par defaut) :
+#! GKE cree automatiquement un disque persistant GCP et le PV associe.
 #! =============================================================================
 
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: postgresql-pv
-  labels: #@ common_labels("postgresql", "database")
-spec:
-  capacity:
-    storage: #@ data.values.postgresql.storage
-  accessModes:
-    - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: manual
-  hostPath:
-    path: /mnt/data/postgresql
-
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -41,4 +26,4 @@ spec:
   resources:
     requests:
       storage: #@ data.values.postgresql.storage
-  storageClassName: manual
+  storageClassName: #@ data.values.postgresql.storageClass
